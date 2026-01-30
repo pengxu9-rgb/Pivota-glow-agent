@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
@@ -124,7 +124,7 @@ async def _agent_invoke(operation: str, payload: dict[str, Any], *, timeout_s: f
     return data if isinstance(data, dict) else {"data": data}
 
 
-async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> dict[str, Any] | None:
+async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> Optional[dict[str, Any]]:
     try:
         result = await _agent_invoke(
             "find_products_multi",
@@ -144,7 +144,7 @@ async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> 
     return first if isinstance(first, dict) else None
 
 
-def _analysis_from_diagnosis(diagnosis: dict[str, Any] | None) -> dict[str, Any]:
+def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
     concerns = diagnosis.get("concerns") if isinstance(diagnosis, dict) else []
     concerns = concerns if isinstance(concerns, list) else []
     cset = {str(c) for c in concerns}
@@ -174,8 +174,8 @@ def _analysis_from_diagnosis(diagnosis: dict[str, Any] | None) -> dict[str, Any]
 @router.post("/diagnosis")
 async def diagnosis(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     skipped = bool(body.get("skipped", False))
     diagnosis_payload = {
@@ -201,11 +201,11 @@ async def diagnosis(
 
 @router.post("/photos")
 async def photos_upload(
-    daylight: UploadFile | None = File(default=None),
-    indoor_white: UploadFile | None = File(default=None),
-    trace_id: str | None = None,
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    daylight: Optional[UploadFile] = File(default=None),
+    indoor_white: Optional[UploadFile] = File(default=None),
+    trace_id: Optional[str] = None,
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     # MVP: accept uploads but do not persist; front-end keeps local previews.
     photos_patch: dict[str, Any] = {}
@@ -221,8 +221,8 @@ async def photos_upload(
 @router.post("/photos/sample")
 async def photos_sample(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     sample_set_id = str(body.get("sample_set_id") or "")
     # Mirror the frontend sample IDs (sample_set_A/B/C).
@@ -257,8 +257,8 @@ async def photos_sample(
 @router.post("/analysis")
 async def analysis(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     diagnosis_payload = body.get("diagnosis") if isinstance(body.get("diagnosis"), dict) else None
     analysis_result = _analysis_from_diagnosis(diagnosis_payload)
@@ -269,8 +269,8 @@ async def analysis(
 @router.post("/analysis/risk")
 async def analysis_risk(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     answer = str(body.get("answer") or "skip")
     using_actives = answer == "yes"
@@ -284,8 +284,8 @@ async def analysis_risk(
 @router.post("/routine/reorder")
 async def routine_reorder(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     _ = str(body.get("preference") or "keep")
 
@@ -371,8 +371,8 @@ async def routine_reorder(
 @router.patch("/routine/selection")
 async def routine_selection(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     selection = body.get("selection") if isinstance(body.get("selection"), dict) else {}
     key = str(selection.get("key") or selection.get("category") or "unknown")
@@ -388,8 +388,8 @@ async def routine_selection(
 @router.post("/checkout")
 async def checkout(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     # MVP: treat as success. Internal checkout can be wired to pivota-agent `create_order` later.
     order_id = f"ORD-{_now_ms()}"
@@ -407,8 +407,8 @@ async def checkout(
 @router.post("/affiliate/outcome")
 async def affiliate_outcome(
     body: dict[str, Any],
-    x_brief_id: str | None = Header(default=None, alias="X-Brief-ID"),
-    x_trace_id: str | None = Header(default=None, alias="X-Trace-ID"),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     # Store/reporting hook can be added later.
     return {"ok": True}

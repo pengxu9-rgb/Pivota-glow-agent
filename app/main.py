@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +11,7 @@ from app.routes.health import router as health_router
 from app.routes.v1 import router as v1_router
 
 
-def _parse_cors_origins(raw: str | None) -> list[str]:
+def _parse_cors_origins(raw: Optional[str]) -> list[str]:
     if not raw:
         return ["*"]
     parts = [p.strip() for p in raw.split(",")]

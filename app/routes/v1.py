@@ -658,9 +658,17 @@ async def routine_reorder(
                 "affiliate_url": url,
             }
 
-        def _aurora_product(category: str, step: Optional[dict[str, Any]], *, fallback_price: float) -> tuple[dict[str, Any], dict[str, Any]]:
+        def _aurora_product(
+            category: str,
+            step: Optional[dict[str, Any]],
+            *,
+            fallback_price: float,
+            variant: Literal["premium", "dupe"],
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
             sku = step.get("sku") if isinstance(step, dict) and isinstance(step.get("sku"), dict) else {}
-            product_id = str(sku.get("sku_id") or sku.get("id") or f"aurora_{uuid.uuid4().hex}")
+            base_id = str(sku.get("sku_id") or sku.get("id") or f"aurora_{uuid.uuid4().hex}")
+            # Ensure premium/dupe have distinct IDs even if Aurora returns the same SKU for both.
+            product_id = f"{base_id}_{variant}"
             name = str(sku.get("name") or f"{category.title()} Pick")
             brand = str(sku.get("brand") or "Aurora")
             currency = str(sku.get("currency") or "USD")
@@ -683,7 +691,13 @@ async def routine_reorder(
                 "image_url": "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
                 "size": "1 unit",
             }
-            offer = _build_offer(product_id, price=price_f, currency=currency, is_dupe=False, q=f"{brand} {name}")
+            offer = _build_offer(
+                product_id,
+                price=price_f,
+                currency=currency,
+                is_dupe=(variant == "dupe"),
+                q=f"{brand} {name}",
+            )
             return product, offer
 
         pairs_by_cat: dict[str, dict[str, Any]] = {}
@@ -691,8 +705,8 @@ async def routine_reorder(
             premium_step = _find_step(premium_steps_am + premium_steps_pm, cat) if premium_steps_am or premium_steps_pm else None
             dupe_step = _find_step(dupe_steps_am + dupe_steps_pm, cat) if dupe_steps_am or dupe_steps_pm else None
 
-            premium_product, premium_offer = _aurora_product(cat, premium_step, fallback_price=55)
-            dupe_product, dupe_offer = _aurora_product(cat, dupe_step, fallback_price=18)
+            premium_product, premium_offer = _aurora_product(cat, premium_step, fallback_price=55, variant="premium")
+            dupe_product, dupe_offer = _aurora_product(cat, dupe_step, fallback_price=18, variant="dupe")
 
             # Mark dupe offer.
             dupe_offer = {**dupe_offer, "badges": ["best_price"], "reliability_score": 70}

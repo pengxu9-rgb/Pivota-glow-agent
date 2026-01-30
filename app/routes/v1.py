@@ -189,14 +189,18 @@ def _sort_by_price(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _find_products(query: str, *, limit: int, timeout_s: float) -> list[dict[str, Any]]:
-    result = await _agent_invoke(
-        "find_products_multi",
-        {
-            "search": {"query": query, "page": 1, "limit": max(1, min(limit, 50)), "in_stock_only": False},
-            "metadata": {"source": "pivota-glow-agent"},
-        },
-        timeout_s=timeout_s,
-    )
+    try:
+        result = await _agent_invoke(
+            "find_products_multi",
+            {
+                "search": {"query": query, "page": 1, "limit": max(1, min(limit, 50)), "in_stock_only": False},
+                "metadata": {"source": "pivota-glow-agent"},
+            },
+            timeout_s=timeout_s,
+        )
+    except Exception as exc:
+        logger.warning("Product search failed. query=%r err=%s", query, exc)
+        return []
 
     products = result.get("products")
     if not isinstance(products, list) or not products:
@@ -632,7 +636,7 @@ async def routine_reorder(
 
     async def get_pair(category: str) -> dict[str, Any]:
         seed = seed_queries.get(category) or category
-        products = await _find_products(seed, limit=25, timeout_s=DEFAULT_TIMEOUT_S)
+        products = await _find_products(seed, limit=10, timeout_s=DEFAULT_TIMEOUT_S)
 
         premium_raw: Optional[dict[str, Any]] = None
         dupe_raw: Optional[dict[str, Any]] = None

@@ -298,6 +298,53 @@ def _aurora_profile_line(
         f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; currentRoutine={routine_str}."
     )
 
+def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"]) -> Any:
+    if not isinstance(clarification, dict):
+        return clarification
+
+    questions = clarification.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return clarification
+
+    templates: dict[str, dict[str, Any]] = {}
+    if language == "CN":
+        templates = {
+            "anchor": {
+                "question": "你想评估的具体产品是？",
+                "options": ["发产品名（品牌 + 名称）", "粘贴购买链接", "上传产品照片/成分表"],
+            },
+            "concerns": {
+                "question": "你最想优先解决的 1-2 个问题是？",
+                "options": ["闭口/黑头", "痘痘", "暗沉/美白", "泛红敏感", "抗老", "补水修护"],
+            },
+        }
+    else:
+        templates = {
+            "anchor": {
+                "question": "Which exact product do you want to evaluate?",
+                "options": ["Send the product name (brand + name)", "Paste a product link", "Upload a product photo/ingredients"],
+            },
+            "concerns": {
+                "question": "What are your top 1–2 priorities right now?",
+                "options": ["Closed comedones/blackheads", "Acne", "Dark spots/brightening", "Redness/sensitivity", "Anti-aging", "Hydration/repair"],
+            },
+        }
+
+    normalized: list[dict[str, Any]] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("id") or "").strip()
+        tpl = templates.get(qid)
+        if tpl:
+            normalized.append({**q, **tpl, "id": qid})
+        else:
+            normalized.append(q)
+
+    if not normalized:
+        return clarification
+    return {**clarification, "questions": normalized}
+
 
 def _analysis_from_aurora_context(
     diagnosis: Optional[dict[str, Any]],
@@ -935,8 +982,10 @@ async def chat(
     budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
     budget = _budget_tier_to_aurora_budget(budget_tier)
     language = body.get("language")
+    lang_code: Literal["EN", "CN"] = "EN"
     reply_language = "English"
     if isinstance(language, str) and language.strip().upper() in {"CN", "ZH", "ZH-CN", "ZH_HANS"}:
+        lang_code = "CN"
         reply_language = "Simplified Chinese"
 
     profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
@@ -958,6 +1007,13 @@ async def chat(
     intent = payload.get("intent") if isinstance(payload, dict) else None
     clarification = payload.get("clarification") if isinstance(payload, dict) else None
     context = payload.get("context") if isinstance(payload, dict) else None
+
+    if intent == "clarify":
+        clarification = _normalize_clarification(clarification, language=lang_code)
+        if lang_code == "CN":
+            answer = "为了给你更准确的建议，我需要先确认一个信息："
+        else:
+            answer = "One quick question so I can answer accurately:"
 
     await SESSION_STORE.upsert(
         brief_id,

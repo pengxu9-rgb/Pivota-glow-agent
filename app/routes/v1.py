@@ -934,6 +934,10 @@ async def chat(
     market = stored.get("market") or body.get("market") or "US"
     budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
     budget = _budget_tier_to_aurora_budget(budget_tier)
+    language = body.get("language")
+    reply_language = "English"
+    if isinstance(language, str) and language.strip().upper() in {"CN", "ZH", "ZH-CN", "ZH_HANS"}:
+        reply_language = "Simplified Chinese"
 
     profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
@@ -941,7 +945,7 @@ async def chat(
     try:
         payload = await aurora_chat(
             base_url=AURORA_DECISION_BASE_URL,
-            query=f"{sys_prompt}{profile}\nUser message: {message.strip()}\nReply in English.",
+            query=f"{sys_prompt}{profile}\nUser message: {message.strip()}\nReply in {reply_language}.",
             timeout_s=DEFAULT_TIMEOUT_S,
             llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
             llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,

@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+import urllib.parse
 from typing import Any, Literal, Optional
 
 import httpx
@@ -23,6 +24,7 @@ PIVOTA_AGENT_GATEWAY_BASE_URL = (os.getenv("PIVOTA_AGENT_GATEWAY_BASE_URL") or "
 PIVOTA_AGENT_API_KEY = (os.getenv("PIVOTA_AGENT_API_KEY") or "").strip() or None
 AURORA_DECISION_BASE_URL = (os.getenv("AURORA_DECISION_BASE_URL") or "https://aurora-beauty-decision-system.vercel.app").rstrip("/")
 GLOW_SYSTEM_PROMPT = (os.getenv("GLOW_SYSTEM_PROMPT") or "").strip()
+USE_PIVOTA_AGENT_SEARCH = (os.getenv("USE_PIVOTA_AGENT_SEARCH") or "").strip().lower() in {"1", "true", "yes", "y"}
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
 
@@ -612,6 +614,122 @@ async def routine_reorder(
         except Exception as exc:
             logger.warning("Aurora routine call failed (budget=%s). err=%s", budget, exc)
             return None
+
+    if not USE_PIVOTA_AGENT_SEARCH:
+        premium_routine, dupe_routine = await asyncio.gather(
+            _aurora_routine_for_budget("¥1000+"),
+            _aurora_routine_for_budget("¥200"),
+        )
+
+        premium_am = premium_routine.get("am") if isinstance(premium_routine, dict) else None
+        premium_pm = premium_routine.get("pm") if isinstance(premium_routine, dict) else None
+        dupe_am = dupe_routine.get("am") if isinstance(dupe_routine, dict) else None
+        dupe_pm = dupe_routine.get("pm") if isinstance(dupe_routine, dict) else None
+
+        premium_steps_am = premium_am if isinstance(premium_am, list) else []
+        premium_steps_pm = premium_pm if isinstance(premium_pm, list) else []
+        dupe_steps_am = dupe_am if isinstance(dupe_am, list) else []
+        dupe_steps_pm = dupe_pm if isinstance(dupe_pm, list) else []
+
+        categories_am = [c for c in (_step_category(s) for s in premium_steps_am) if c] or categories_am
+        categories_pm = [c for c in (_step_category(s) for s in premium_steps_pm) if c] or categories_pm
+        all_categories = sorted(set(categories_am + categories_pm))
+
+        def _find_step(steps: list[dict[str, Any]], category: str) -> Optional[dict[str, Any]]:
+            for step in steps:
+                if _step_category(step) == category:
+                    return step
+            return None
+
+        def _build_offer(product_id: str, *, price: float, currency: str, is_dupe: bool, q: str) -> dict[str, Any]:
+            url = f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
+            return {
+                "offer_id": _mk_offer_id("aurora_offer", product_id),
+                "seller": "Aurora",
+                "price": round(price, 2),
+                "currency": currency,
+                "original_price": None,
+                "shipping_days": 5,
+                "returns_policy": "See retailer policy",
+                "reliability_score": 75,
+                "badges": ["best_price"] if is_dupe else ["high_reliability"],
+                "in_stock": True,
+                "purchase_route": "affiliate_outbound",
+                "affiliate_url": url,
+            }
+
+        def _aurora_product(category: str, step: Optional[dict[str, Any]], *, fallback_price: float) -> tuple[dict[str, Any], dict[str, Any]]:
+            sku = step.get("sku") if isinstance(step, dict) and isinstance(step.get("sku"), dict) else {}
+            product_id = str(sku.get("sku_id") or sku.get("id") or f"aurora_{uuid.uuid4().hex}")
+            name = str(sku.get("name") or f"{category.title()} Pick")
+            brand = str(sku.get("brand") or "Aurora")
+            currency = str(sku.get("currency") or "USD")
+            try:
+                price_f = float(sku.get("price") or 0)
+            except Exception:
+                price_f = 0.0
+            if price_f <= 0:
+                price_f = fallback_price
+
+            notes = step.get("notes") if isinstance(step, dict) else None
+            note_text = " ".join(str(n) for n in notes) if isinstance(notes, list) else ""
+
+            product = {
+                "sku_id": product_id,
+                "name": name,
+                "brand": brand,
+                "category": category,
+                "description": note_text[:2000],
+                "image_url": "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
+                "size": "1 unit",
+            }
+            offer = _build_offer(product_id, price=price_f, currency=currency, is_dupe=False, q=f"{brand} {name}")
+            return product, offer
+
+        pairs_by_cat: dict[str, dict[str, Any]] = {}
+        for cat in all_categories:
+            premium_step = _find_step(premium_steps_am + premium_steps_pm, cat) if premium_steps_am or premium_steps_pm else None
+            dupe_step = _find_step(dupe_steps_am + dupe_steps_pm, cat) if dupe_steps_am or dupe_steps_pm else None
+
+            premium_product, premium_offer = _aurora_product(cat, premium_step, fallback_price=55)
+            dupe_product, dupe_offer = _aurora_product(cat, dupe_step, fallback_price=18)
+
+            # Mark dupe offer.
+            dupe_offer = {**dupe_offer, "badges": ["best_price"], "reliability_score": 70}
+
+            pairs_by_cat[cat] = {
+                "category": cat,
+                "premium": {"product": premium_product, "offers": [premium_offer]},
+                "dupe": {"product": dupe_product, "offers": [dupe_offer]},
+            }
+
+        am_pairs = [pairs_by_cat[c] for c in categories_am if c in pairs_by_cat]
+        pm_pairs = [pairs_by_cat[c] for c in categories_pm if c in pairs_by_cat]
+
+        selected_offers: dict[str, str] = {}
+        for p in pairs_by_cat.values():
+            selected_offers[p["premium"]["product"]["sku_id"]] = p["premium"]["offers"][0]["offer_id"]
+            selected_offers[p["dupe"]["product"]["sku_id"]] = p["dupe"]["offers"][0]["offer_id"]
+
+        patch = {
+            "productPairs": {"am": am_pairs, "pm": pm_pairs},
+            "selected_offers": selected_offers,
+            "routine_conflicts": [],
+            "next_state": "S7_PRODUCT_RECO",
+        }
+        await SESSION_STORE.upsert(
+            brief_id,
+            {
+                "trace_id": x_trace_id,
+                "state": patch["next_state"],
+                "productPairs": patch["productPairs"],
+                "selected_offers": patch["selected_offers"],
+                "preference": preference,
+                "market": market,
+                "budget_tier": budget_tier,
+            },
+        )
+        return {"session": patch, "next_state": patch["next_state"], "productPairs": patch["productPairs"]}
 
     # Ask Aurora for a routine blueprint; use its products as seed queries.
     try:

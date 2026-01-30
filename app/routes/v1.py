@@ -10,7 +10,7 @@ from typing import Any, Literal, Optional
 import httpx
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 
-from app.services.aurora import aurora_chat, extract_json_object
+from app.services.aurora import aurora_chat
 from app.services.session_store import SESSION_STORE
 
 
@@ -22,6 +22,7 @@ logger = logging.getLogger("pivota-glow-agent.v1")
 PIVOTA_AGENT_GATEWAY_BASE_URL = (os.getenv("PIVOTA_AGENT_GATEWAY_BASE_URL") or "https://pivota-agent-production.up.railway.app").rstrip("/")
 PIVOTA_AGENT_API_KEY = (os.getenv("PIVOTA_AGENT_API_KEY") or "").strip() or None
 AURORA_DECISION_BASE_URL = (os.getenv("AURORA_DECISION_BASE_URL") or "https://aurora-beauty-decision-system.vercel.app").rstrip("/")
+GLOW_SYSTEM_PROMPT = (os.getenv("GLOW_SYSTEM_PROMPT") or "").strip()
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
 
@@ -177,83 +178,85 @@ def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, A
     return {"features": features, "strategy": strategy, "needs_risk_check": needs_risk}
 
 
+def _budget_tier_to_aurora_budget(budget_tier: Any) -> str:
+    mapping = {"$": "¥200", "$$": "¥500", "$$$": "¥1000+"}
+    if isinstance(budget_tier, str):
+        v = budget_tier.strip()
+        if v in mapping:
+            return mapping[v]
+        if v.startswith("¥"):
+            return v
+        if v.isdigit():
+            return f"¥{v}"
+    return "¥500"
+
+
+def _aurora_profile_line(
+    *,
+    diagnosis: Optional[dict[str, Any]],
+    market: str,
+    budget: str,
+) -> str:
+    skin_type = None
+    concerns: list[str] = []
+    current_routine = None
+
+    if isinstance(diagnosis, dict):
+        skin_type = diagnosis.get("skinType") or diagnosis.get("skin_type")
+        concerns_raw = diagnosis.get("concerns")
+        if isinstance(concerns_raw, list):
+            concerns = [str(c) for c in concerns_raw if c]
+        current_routine = diagnosis.get("currentRoutine") or diagnosis.get("current_routine")
+
+    concerns_str = ", ".join(concerns) if concerns else "none"
+    skin_str = str(skin_type or "unknown")
+    routine_str = str(current_routine or "basic")
+
+    return (
+        f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; currentRoutine={routine_str}."
+    )
+
+
+def _analysis_from_aurora_context(
+    diagnosis: Optional[dict[str, Any]],
+    aurora_context: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    base = _analysis_from_diagnosis(diagnosis)
+    detected = aurora_context.get("detected") if isinstance(aurora_context, dict) else None
+    if not isinstance(detected, dict):
+        return base
+
+    features: list[dict[str, Any]] = []
+    if detected.get("oily_acne") is True:
+        features.extend(
+            [
+                {"observation": "Higher oil/shine patterns (acne-prone tendency)", "confidence": "pretty_sure"},
+                {"observation": "Pores may clog more easily without gentle balancing", "confidence": "somewhat_sure"},
+            ]
+        )
+    if detected.get("sensitive_skin") is True:
+        features.extend(
+            [
+                {"observation": "Skin looks reactive/sensitive (irritation risk)", "confidence": "somewhat_sure"},
+            ]
+        )
+    if detected.get("barrier_impaired") is True:
+        features.extend(
+            [
+                {"observation": "Barrier may be stressed (prioritize repair + low irritation)", "confidence": "pretty_sure"},
+            ]
+        )
+
+    merged_features = features + base.get("features", [])
+    if merged_features:
+        base["features"] = merged_features[:6]
+
+    return base
+
 def _require_brief_id(x_brief_id: Optional[str]) -> str:
     if not x_brief_id:
         raise HTTPException(status_code=400, detail="Missing X-Brief-ID")
     return x_brief_id
-
-
-def _coerce_analysis(raw: Any) -> Optional[dict[str, Any]]:
-    if not isinstance(raw, dict):
-        return None
-    features_raw = raw.get("features")
-    if not isinstance(features_raw, list):
-        return None
-    features: list[dict[str, Any]] = []
-    for item in features_raw:
-        if not isinstance(item, dict):
-            continue
-        obs = item.get("observation")
-        conf = item.get("confidence")
-        if not isinstance(obs, str) or not obs.strip():
-            continue
-        if conf not in {"pretty_sure", "somewhat_sure", "not_sure"}:
-            conf = "somewhat_sure"
-        features.append({"observation": obs.strip()[:240], "confidence": conf})
-
-    strategy = raw.get("strategy")
-    if not isinstance(strategy, str) or not strategy.strip():
-        strategy = "Build a simple routine: cleanse → treat (if needed) → moisturize → SPF."
-
-    needs_risk_check = raw.get("needs_risk_check")
-    needs_risk_check = bool(needs_risk_check) if isinstance(needs_risk_check, bool) else False
-
-    if not features:
-        return None
-    return {"features": features[:6], "strategy": strategy.strip()[:600], "needs_risk_check": needs_risk_check}
-
-
-def _build_aurora_analysis_query(context: dict[str, Any]) -> str:
-    return (
-        "You are Aurora Beauty Decision System v4.0.\n"
-        "Given the user context below, produce a concise skin analysis.\n"
-        "\n"
-        "Return ONLY valid JSON (no markdown, no backticks, no extra text) with this exact shape:\n"
-        "{\n"
-        '  "analysis": {\n'
-        '    "features": [{"observation": string, "confidence": "pretty_sure"|"somewhat_sure"|"not_sure"}],\n'
-        '    "strategy": string,\n'
-        '    "needs_risk_check": boolean\n'
-        "  }\n"
-        "}\n"
-        "\n"
-        "Rules:\n"
-        "- If fields are missing, make reasonable assumptions and proceed; do NOT ask clarification questions.\n"
-        "- Keep it safe and conservative. No medical diagnosis.\n"
-        "\n"
-        f"Context JSON:\n{context}\n"
-    )
-
-
-def _build_aurora_routine_query(context: dict[str, Any]) -> str:
-    return (
-        "You are Aurora Beauty Decision System v4.0.\n"
-        "Create an AM/PM routine blueprint and search queries for products.\n"
-        "\n"
-        "Return ONLY valid JSON (no markdown, no backticks, no extra text) with this exact shape:\n"
-        "{\n"
-        '  "am": [{"category": "cleanser"|"treatment"|"moisturizer"|"sunscreen", "premium_query": string, "dupe_query": string}],\n'
-        '  "pm": [{"category": "cleanser"|"treatment"|"moisturizer"|"sunscreen", "premium_query": string, "dupe_query": string}],\n'
-        '  "conflicts": [string]\n'
-        "}\n"
-        "\n"
-        "Rules:\n"
-        "- If context is missing, make reasonable assumptions; do NOT ask clarification questions.\n"
-        "- Keep the routine minimal and realistic (3-4 steps AM, 2-3 steps PM).\n"
-        '- Use broad, shopper-friendly queries (e.g., "CeraVe hydrating cleanser").\n'
-        "\n"
-        f"Context JSON:\n{context}\n"
-    )
 
 
 @router.post("/diagnosis")
@@ -380,37 +383,26 @@ async def analysis(
     if diagnosis_payload is None and isinstance(body.get("diagnosis"), dict):
         diagnosis_payload = body.get("diagnosis")
 
-    intent_id = stored.get("intent_id") or body.get("intent_id") or "routine"
     market = stored.get("market") or body.get("market") or "US"
     budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
-    photos = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
-    photos_present = False
-    if isinstance(photos, dict):
-        photos_present = any(isinstance(v, dict) and (v.get("preview_url") or v.get("qc_status")) for v in photos.values())
+    budget = _budget_tier_to_aurora_budget(budget_tier)
 
-    context = {
-        "intent_id": intent_id,
-        "market": market,
-        "budget_tier": budget_tier,
-        "diagnosis": diagnosis_payload,
-        "photos_present": photos_present,
-    }
-
-    analysis_result: dict[str, Any]
+    aurora_context: Optional[dict[str, Any]] = None
     try:
-        query = _build_aurora_analysis_query(context)
         aurora_payload = await aurora_chat(
             base_url=AURORA_DECISION_BASE_URL,
-            query=query,
+            query=(
+                f"{_aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
+                "Give a brief diagnosis and a safe, minimal routine strategy. Reply in English."
+            ),
             timeout_s=DEFAULT_TIMEOUT_S,
         )
-        aurora_answer = aurora_payload.get("answer") if isinstance(aurora_payload, dict) else None
-        parsed = extract_json_object(aurora_answer) if isinstance(aurora_answer, str) else None
-        coerced = _coerce_analysis((parsed or {}).get("analysis") if isinstance(parsed, dict) else None)
-        analysis_result = coerced or _analysis_from_diagnosis(diagnosis_payload)
+        aurora_ctx_raw = aurora_payload.get("context") if isinstance(aurora_payload, dict) else None
+        aurora_context = aurora_ctx_raw if isinstance(aurora_ctx_raw, dict) else None
     except Exception as exc:
-        logger.warning("Aurora analysis failed; falling back. err=%s", exc)
-        analysis_result = _analysis_from_diagnosis(diagnosis_payload)
+        logger.warning("Aurora analysis call failed; falling back. err=%s", exc)
+
+    analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
 
     patch = {"analysis": analysis_result, "next_state": "S5_ANALYSIS_SUMMARY"}
     await SESSION_STORE.upsert(
@@ -419,6 +411,7 @@ async def analysis(
             "trace_id": x_trace_id,
             "state": patch["next_state"],
             "analysis": analysis_result,
+            "aurora_context": aurora_context,
         },
     )
     return {"session": patch, "next_state": patch["next_state"], "analysis": analysis_result}
@@ -463,7 +456,7 @@ async def routine_reorder(
     diagnosis_payload = stored.get("diagnosis") if isinstance(stored.get("diagnosis"), dict) else None
     analysis_payload = stored.get("analysis") if isinstance(stored.get("analysis"), dict) else None
 
-    # Default queries (fallback only)
+    # Default queries (fallback only).
     queries: dict[str, dict[str, str]] = {
         "cleanser": {"premium": "Sulwhasoo cleansing foam", "dupe": "CeraVe hydrating cleanser"},
         "treatment": {"premium": "SkinCeuticals vitamin c serum", "dupe": "The Ordinary niacinamide serum"},
@@ -475,55 +468,89 @@ async def routine_reorder(
     categories_pm = ["cleanser", "treatment", "moisturizer"]
     conflicts: list[str] = []
 
-    # Ask Aurora to propose category order + search queries.
+    def _step_category(step: dict[str, Any]) -> Optional[str]:
+        sku = step.get("sku") if isinstance(step.get("sku"), dict) else {}
+        cat = sku.get("category")
+        if isinstance(cat, str):
+            c = cat.strip().lower()
+            if c in {"cleanser", "treatment", "moisturizer", "sunscreen"}:
+                return c
+        step_name = step.get("step")
+        if isinstance(step_name, str):
+            s = step_name.lower()
+            if "clean" in s:
+                return "cleanser"
+            if "treat" in s or "serum" in s or "active" in s:
+                return "treatment"
+            if "moist" in s or "cream" in s:
+                return "moisturizer"
+            if "spf" in s or "sun" in s:
+                return "sunscreen"
+        return None
+
+    def _step_query(step: dict[str, Any]) -> Optional[str]:
+        sku = step.get("sku") if isinstance(step.get("sku"), dict) else {}
+        name = sku.get("name")
+        brand = sku.get("brand")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if isinstance(brand, str) and brand.strip() and brand.strip().lower() != "unknown":
+            return f"{brand.strip()} {name.strip()}"[:120]
+        return name.strip()[:120]
+
+    async def _aurora_routine_for_budget(budget: str) -> Optional[dict[str, Any]]:
+        try:
+            payload = await aurora_chat(
+                base_url=AURORA_DECISION_BASE_URL,
+                query=(
+                    f"{_aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
+                    f"Preference: {preference}. Reply in English."
+                ),
+                timeout_s=DEFAULT_TIMEOUT_S,
+            )
+            ctx = payload.get("context") if isinstance(payload, dict) else None
+            if not isinstance(ctx, dict):
+                return None
+            routine = ctx.get("routine")
+            return routine if isinstance(routine, dict) else None
+        except Exception as exc:
+            logger.warning("Aurora routine call failed (budget=%s). err=%s", budget, exc)
+            return None
+
+    # Ask Aurora for two routines: premium + dupe. We convert those into shopper-friendly
+    # search queries and then use pivota-agent to source real offers/SKUs.
     try:
-        context = {
-            "intent_id": intent_id,
-            "market": market,
-            "budget_tier": budget_tier,
-            "preference": preference,
-            "diagnosis": diagnosis_payload,
-            "analysis": analysis_payload,
-        }
-        aurora_payload = await aurora_chat(
-            base_url=AURORA_DECISION_BASE_URL,
-            query=_build_aurora_routine_query(context),
-            timeout_s=DEFAULT_TIMEOUT_S,
+        premium_routine, dupe_routine = await asyncio.gather(
+            _aurora_routine_for_budget("¥1000+"),
+            _aurora_routine_for_budget("¥200"),
         )
-        aurora_answer = aurora_payload.get("answer") if isinstance(aurora_payload, dict) else None
-        parsed = extract_json_object(aurora_answer) if isinstance(aurora_answer, str) else None
-        if isinstance(parsed, dict):
-            def _read_steps(key: str) -> list[dict[str, Any]]:
-                v = parsed.get(key)
-                return v if isinstance(v, list) else []
 
-            def _norm_category(cat: Any) -> Optional[str]:
-                if not isinstance(cat, str):
-                    return None
-                c = cat.strip().lower()
-                return c if c in {"cleanser", "treatment", "moisturizer", "sunscreen"} else None
+        premium_am = premium_routine.get("am") if isinstance(premium_routine, dict) else None
+        premium_pm = premium_routine.get("pm") if isinstance(premium_routine, dict) else None
+        dupe_am = dupe_routine.get("am") if isinstance(dupe_routine, dict) else None
+        dupe_pm = dupe_routine.get("pm") if isinstance(dupe_routine, dict) else None
 
-            am_steps = _read_steps("am")
-            pm_steps = _read_steps("pm")
-            if am_steps:
-                categories_am = [c for c in (_norm_category(s.get("category")) for s in am_steps) if c] or categories_am
-            if pm_steps:
-                categories_pm = [c for c in (_norm_category(s.get("category")) for s in pm_steps) if c] or categories_pm
+        premium_steps_am = premium_am if isinstance(premium_am, list) else []
+        premium_steps_pm = premium_pm if isinstance(premium_pm, list) else []
+        dupe_steps_am = dupe_am if isinstance(dupe_am, list) else []
+        dupe_steps_pm = dupe_pm if isinstance(dupe_pm, list) else []
 
-            for step in am_steps + pm_steps:
-                cat = _norm_category(step.get("category"))
-                if not cat:
-                    continue
-                premium_q = step.get("premium_query")
-                dupe_q = step.get("dupe_query")
-                if isinstance(premium_q, str) and premium_q.strip():
-                    queries.setdefault(cat, {})["premium"] = premium_q.strip()[:120]
-                if isinstance(dupe_q, str) and dupe_q.strip():
-                    queries.setdefault(cat, {})["dupe"] = dupe_q.strip()[:120]
+        ordered_am = [c for c in (_step_category(s) for s in premium_steps_am) if c] or categories_am
+        ordered_pm = [c for c in (_step_category(s) for s in premium_steps_pm) if c] or categories_pm
+        categories_am = ordered_am
+        categories_pm = ordered_pm
 
-            conflicts_raw = parsed.get("conflicts")
-            if isinstance(conflicts_raw, list):
-                conflicts = [str(x)[:200] for x in conflicts_raw if x]
+        for step in premium_steps_am + premium_steps_pm:
+            cat = _step_category(step)
+            q = _step_query(step)
+            if cat and q:
+                queries.setdefault(cat, {})["premium"] = q
+
+        for step in dupe_steps_am + dupe_steps_pm:
+            cat = _step_category(step)
+            q = _step_query(step)
+            if cat and q:
+                queries.setdefault(cat, {})["dupe"] = q
     except Exception as exc:
         logger.warning("Aurora routine planning failed; using fallback queries. err=%s", exc)
 
@@ -671,3 +698,60 @@ async def affiliate_outcome(
     _ = _require_brief_id(x_brief_id)
     # Store/reporting hook can be added later.
     return {"ok": True}
+
+
+@router.post("/chat")
+async def chat(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    brief_id = _require_brief_id(x_brief_id)
+    stored = await SESSION_STORE.get(brief_id)
+
+    message = body.get("message") or body.get("query")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=400, detail="Missing `message`")
+
+    diagnosis_payload = stored.get("diagnosis") if isinstance(stored.get("diagnosis"), dict) else None
+    market = stored.get("market") or body.get("market") or "US"
+    budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
+    budget = _budget_tier_to_aurora_budget(budget_tier)
+
+    profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
+    sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
+
+    try:
+        payload = await aurora_chat(
+            base_url=AURORA_DECISION_BASE_URL,
+            query=f"{sys_prompt}{profile}\nUser message: {message.strip()}\nReply in English.",
+            timeout_s=DEFAULT_TIMEOUT_S,
+            llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
+            llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
+        )
+    except Exception as exc:
+        logger.error("Aurora chat failed. err=%s", exc)
+        raise HTTPException(status_code=502, detail={"upstream": "aurora", "error": str(exc)}) from exc
+
+    answer = payload.get("answer") if isinstance(payload, dict) else None
+    intent = payload.get("intent") if isinstance(payload, dict) else None
+    clarification = payload.get("clarification") if isinstance(payload, dict) else None
+    context = payload.get("context") if isinstance(payload, dict) else None
+
+    await SESSION_STORE.upsert(
+        brief_id,
+        {
+            "trace_id": x_trace_id,
+            "last_user_message": message.strip()[:2000],
+            "last_aurora_intent": intent,
+            "last_aurora_answer": answer,
+            "aurora_context": context if isinstance(context, dict) else None,
+        },
+    )
+
+    return {
+        "answer": answer,
+        "intent": intent,
+        "clarification": clarification,
+        "context": context,
+    }

@@ -131,80 +131,100 @@ async def _agent_invoke(operation: str, payload: dict[str, Any], *, timeout_s: f
     return data if isinstance(data, dict) else {"data": data}
 
 
-async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> Optional[dict[str, Any]]:
-    try:
-        result = await _agent_invoke(
-            "find_products_multi",
-            {
-                "search": {"query": query, "page": 1, "limit": max(1, min(limit, 20)), "in_stock_only": False},
-                "metadata": {"source": "pivota-glow-agent"},
-            },
-            timeout_s=timeout_s,
-        )
-    except Exception:
-        return None
+def _guess_category_from_query(query: str) -> str:
+    ql = query.lower()
+    if any(k in ql for k in ["cleanser", "face wash", "cleansing"]):
+        return "cleanser"
+    if any(k in ql for k in ["moisturizer", "moisturising", "cream", "lotion"]):
+        return "moisturizer"
+    if any(k in ql for k in ["sunscreen", "spf", "uv"]):
+        return "sunscreen"
+    return "treatment"
+
+
+def _score_product_for_category(category: str, product: dict[str, Any]) -> int:
+    title = str(product.get("title") or product.get("name") or "")
+    desc = str(product.get("description") or "")
+    text = f"{title}\n{desc}".lower()
+
+    positives = {
+        "cleanser": ["cleanser", "face wash", "cleansing", "foam", "gel cleanser"],
+        "moisturizer": ["moisturizer", "moisturising", "cream", "lotion", "hydrating cream"],
+        "sunscreen": ["sunscreen", "sun screen", "spf", "uv"],
+        "treatment": ["serum", "retinol", "niacinamide", "vitamin c", "aha", "bha", "acid", "treatment", "ampoule"],
+    }.get(category, [])
+
+    negatives = [
+        "brush",
+        "makeup",
+        "foundation",
+        "concealer",
+        "mascara",
+        "lipstick",
+        "lip gloss",
+        "eyeshadow",
+        "blush",
+        "highlighter",
+        "palette",
+    ]
+
+    s = 0
+    for kw in positives:
+        if kw in text:
+            s += 2
+    for kw in negatives:
+        if kw in text:
+            s -= 3
+    return s
+
+
+def _sort_by_price(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _price(p: dict[str, Any]) -> float:
+        try:
+            return float(p.get("price") or 0)
+        except Exception:
+            return 0.0
+
+    return sorted(products, key=_price)
+
+
+async def _find_products(query: str, *, limit: int, timeout_s: float) -> list[dict[str, Any]]:
+    result = await _agent_invoke(
+        "find_products_multi",
+        {
+            "search": {"query": query, "page": 1, "limit": max(1, min(limit, 50)), "in_stock_only": False},
+            "metadata": {"source": "pivota-glow-agent"},
+        },
+        timeout_s=timeout_s,
+    )
 
     products = result.get("products")
     if not isinstance(products, list) or not products:
-        return None
+        return []
 
-    def score(category: str, product: dict[str, Any]) -> int:
-        title = str(product.get("title") or product.get("name") or "")
-        desc = str(product.get("description") or "")
-        text = f"{title}\n{desc}".lower()
-
-        positives = {
-            "cleanser": ["cleanser", "face wash", "cleansing", "foam", "gel cleanser"],
-            "moisturizer": ["moisturizer", "moisturising", "cream", "lotion", "hydrating cream"],
-            "sunscreen": ["sunscreen", "sun screen", "spf", "uv"],
-            "treatment": ["serum", "retinol", "niacinamide", "vitamin c", "aha", "bha", "acid", "treatment", "ampoule"],
-        }.get(category, [])
-
-        negatives = [
-            "brush",
-            "makeup",
-            "foundation",
-            "concealer",
-            "mascara",
-            "lipstick",
-            "lip gloss",
-            "eyeshadow",
-            "blush",
-            "highlighter",
-            "palette",
-        ]
-
-        s = 0
-        for kw in positives:
-            if kw in text:
-                s += 2
-        for kw in negatives:
-            if kw in text:
-                s -= 3
-        return s
-
-    category_guess = "treatment"
-    ql = query.lower()
-    if any(k in ql for k in ["cleanser", "face wash", "cleansing"]):
-        category_guess = "cleanser"
-    elif any(k in ql for k in ["moisturizer", "moisturising", "cream", "lotion"]):
-        category_guess = "moisturizer"
-    elif any(k in ql for k in ["sunscreen", "spf", "uv"]):
-        category_guess = "sunscreen"
-
-    best: Optional[dict[str, Any]] = None
-    best_score = -10_000
+    category_guess = _guess_category_from_query(query)
+    scored: list[tuple[int, dict[str, Any]]] = []
     for p in products:
         if not isinstance(p, dict):
             continue
-        s = score(category_guess, p)
-        if s > best_score:
-            best_score = s
-            best = p
+        scored.append((_score_product_for_category(category_guess, p), p))
 
-    if best is None or best_score <= 0:
+    # Prefer category-looking hits; if none, return raw list to allow price-based picking.
+    scored.sort(key=lambda x: x[0], reverse=True)
+    positive = [p for s, p in scored if s > 0]
+    return positive if positive else [p for _, p in scored]
+
+
+async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> Optional[dict[str, Any]]:
+    try:
+        products = await _find_products(query, limit=limit, timeout_s=timeout_s)
+    except Exception:
         return None
-    return best
+
+    if not products:
+        return None
+    first = products[0]
+    return first if isinstance(first, dict) else None
 
 
 def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -512,12 +532,13 @@ async def routine_reorder(
     diagnosis_payload = stored.get("diagnosis") if isinstance(stored.get("diagnosis"), dict) else None
     analysis_payload = stored.get("analysis") if isinstance(stored.get("analysis"), dict) else None
 
-    # Default queries (fallback only).
-    queries: dict[str, dict[str, str]] = {
-        "cleanser": {"premium": "Sulwhasoo cleansing foam", "dupe": "CeraVe hydrating cleanser"},
-        "treatment": {"premium": "SkinCeuticals vitamin c serum", "dupe": "The Ordinary niacinamide serum"},
-        "moisturizer": {"premium": "La Mer moisturizer", "dupe": "CeraVe moisturizing cream"},
-        "sunscreen": {"premium": "Shiseido sunscreen", "dupe": "La Roche-Posay sunscreen"},
+    # Default seed queries (fallback only). We run one product search per category,
+    # then pick a "premium" and "dupe" by price from the result set.
+    seed_queries: dict[str, str] = {
+        "cleanser": "gel cleanser",
+        "treatment": "niacinamide serum",
+        "moisturizer": "face moisturizer",
+        "sunscreen": "sunscreen SPF 50",
     }
 
     categories_am = ["cleanser", "treatment", "moisturizer", "sunscreen"]
@@ -588,56 +609,45 @@ async def routine_reorder(
             logger.warning("Aurora routine call failed (budget=%s). err=%s", budget, exc)
             return None
 
-    # Ask Aurora for two routines: premium + dupe. We convert those into shopper-friendly
-    # search queries and then use pivota-agent to source real offers/SKUs.
+    # Ask Aurora for a routine blueprint; use its products as seed queries.
     try:
-        premium_routine, dupe_routine = await asyncio.gather(
-            _aurora_routine_for_budget("¥1000+"),
-            _aurora_routine_for_budget("¥200"),
-        )
+        budget = _budget_tier_to_aurora_budget(budget_tier)
+        routine = await _aurora_routine_for_budget(budget)
 
-        premium_am = premium_routine.get("am") if isinstance(premium_routine, dict) else None
-        premium_pm = premium_routine.get("pm") if isinstance(premium_routine, dict) else None
-        dupe_am = dupe_routine.get("am") if isinstance(dupe_routine, dict) else None
-        dupe_pm = dupe_routine.get("pm") if isinstance(dupe_routine, dict) else None
+        routine_am = routine.get("am") if isinstance(routine, dict) else None
+        routine_pm = routine.get("pm") if isinstance(routine, dict) else None
+        steps_am = routine_am if isinstance(routine_am, list) else []
+        steps_pm = routine_pm if isinstance(routine_pm, list) else []
 
-        premium_steps_am = premium_am if isinstance(premium_am, list) else []
-        premium_steps_pm = premium_pm if isinstance(premium_pm, list) else []
-        dupe_steps_am = dupe_am if isinstance(dupe_am, list) else []
-        dupe_steps_pm = dupe_pm if isinstance(dupe_pm, list) else []
+        categories_am = [c for c in (_step_category(s) for s in steps_am) if c] or categories_am
+        categories_pm = [c for c in (_step_category(s) for s in steps_pm) if c] or categories_pm
 
-        ordered_am = [c for c in (_step_category(s) for s in premium_steps_am) if c] or categories_am
-        ordered_pm = [c for c in (_step_category(s) for s in premium_steps_pm) if c] or categories_pm
-        categories_am = ordered_am
-        categories_pm = ordered_pm
-
-        for step in premium_steps_am + premium_steps_pm:
+        for step in steps_am + steps_pm:
             cat = _step_category(step)
             q = _step_query(step)
             if cat and q:
-                queries.setdefault(cat, {})["premium"] = q
-
-        for step in dupe_steps_am + dupe_steps_pm:
-            cat = _step_category(step)
-            q = _step_query(step)
-            if cat and q:
-                queries.setdefault(cat, {})["dupe"] = q
+                seed_queries[cat] = q
     except Exception as exc:
         logger.warning("Aurora routine planning failed; using fallback queries. err=%s", exc)
 
     async def get_pair(category: str) -> dict[str, Any]:
-        q = queries[category]
-        premium_q = q["premium"]
-        dupe_q = q["dupe"]
+        seed = seed_queries.get(category) or category
+        products = await _find_products(seed, limit=25, timeout_s=DEFAULT_TIMEOUT_S)
 
-        premium_raw, dupe_raw = await asyncio.gather(
-            _find_one_product(premium_q, limit=5, timeout_s=DEFAULT_TIMEOUT_S),
-            _find_one_product(dupe_q, limit=5, timeout_s=DEFAULT_TIMEOUT_S),
-            return_exceptions=False,
-        )
+        premium_raw: Optional[dict[str, Any]] = None
+        dupe_raw: Optional[dict[str, Any]] = None
+        if products:
+            ranked = _sort_by_price([p for p in products if isinstance(p, dict)])
+            if ranked:
+                dupe_raw = ranked[0]
+                premium_raw = ranked[-1]
+                if (
+                    premium_raw.get("product_id") == dupe_raw.get("product_id")
+                    and len(ranked) > 1
+                ):
+                    premium_raw = ranked[-2]
 
         if not premium_raw or not dupe_raw:
-            # Fallback: minimal, but keeps UI functional.
             premium_raw = premium_raw or {
                 "product_id": f"demo_{category}_premium",
                 "title": f"{category.title()} Premium",

@@ -147,8 +147,64 @@ async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> 
     products = result.get("products")
     if not isinstance(products, list) or not products:
         return None
-    first = products[0]
-    return first if isinstance(first, dict) else None
+
+    def score(category: str, product: dict[str, Any]) -> int:
+        title = str(product.get("title") or product.get("name") or "")
+        desc = str(product.get("description") or "")
+        text = f"{title}\n{desc}".lower()
+
+        positives = {
+            "cleanser": ["cleanser", "face wash", "cleansing", "foam", "gel cleanser"],
+            "moisturizer": ["moisturizer", "moisturising", "cream", "lotion", "hydrating cream"],
+            "sunscreen": ["sunscreen", "sun screen", "spf", "uv"],
+            "treatment": ["serum", "retinol", "niacinamide", "vitamin c", "aha", "bha", "acid", "treatment", "ampoule"],
+        }.get(category, [])
+
+        negatives = [
+            "brush",
+            "makeup",
+            "foundation",
+            "concealer",
+            "mascara",
+            "lipstick",
+            "lip gloss",
+            "eyeshadow",
+            "blush",
+            "highlighter",
+            "palette",
+        ]
+
+        s = 0
+        for kw in positives:
+            if kw in text:
+                s += 2
+        for kw in negatives:
+            if kw in text:
+                s -= 3
+        return s
+
+    category_guess = "treatment"
+    ql = query.lower()
+    if any(k in ql for k in ["cleanser", "face wash", "cleansing"]):
+        category_guess = "cleanser"
+    elif any(k in ql for k in ["moisturizer", "moisturising", "cream", "lotion"]):
+        category_guess = "moisturizer"
+    elif any(k in ql for k in ["sunscreen", "spf", "uv"]):
+        category_guess = "sunscreen"
+
+    best: Optional[dict[str, Any]] = None
+    best_score = -10_000
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        s = score(category_guess, p)
+        if s > best_score:
+            best_score = s
+            best = p
+
+    if best is None or best_score <= 0:
+        return None
+    return best
 
 
 def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -490,13 +546,28 @@ async def routine_reorder(
 
     def _step_query(step: dict[str, Any]) -> Optional[str]:
         sku = step.get("sku") if isinstance(step.get("sku"), dict) else {}
+        cat = _step_category(step)
         name = sku.get("name")
         brand = sku.get("brand")
         if not isinstance(name, str) or not name.strip():
             return None
-        if isinstance(brand, str) and brand.strip() and brand.strip().lower() != "unknown":
-            return f"{brand.strip()} {name.strip()}"[:120]
-        return name.strip()[:120]
+        base = f"{brand.strip()} {name.strip()}" if isinstance(brand, str) and brand.strip() and brand.strip().lower() != "unknown" else name.strip()
+
+        suffix = None
+        if cat == "cleanser":
+            suffix = "cleanser"
+        elif cat == "moisturizer":
+            suffix = "moisturizer"
+        elif cat == "sunscreen":
+            suffix = "sunscreen SPF"
+        elif cat == "treatment":
+            suffix = "serum"
+
+        q = base
+        if suffix and suffix.split()[0] not in q.lower():
+            q = f"{q} {suffix}"
+
+        return q[:120]
 
     async def _aurora_routine_for_budget(budget: str) -> Optional[dict[str, Any]]:
         try:

@@ -1,5 +1,10 @@
-# Override parent repo-level .railwayignore allowlist.
-# This service repo is small; upload the full source.
+# Parent repo has a top-level `.railwayignore` that ignores everything (`**`)
+# and allowlists only a few directories/files.
+#
+# This repo is deployed as its own service, so we re-include everything here
+# and then ignore only local build artifacts.
+
+!**
 
 .git/
 .env
@@ -12,4 +17,3 @@ __pycache__/
 dist/
 build/
 .DS_Store
-

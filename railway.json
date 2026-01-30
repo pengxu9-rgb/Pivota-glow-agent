@@ -4,6 +4,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "/opt/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir /app"
+    "startCommand": "pwd; echo \"PORT=$PORT\"; ls -la; echo \"--- /app ---\"; ls -la /app || true; echo \"--- /app (depth 2 files) ---\"; find /app -maxdepth 2 -type f -print || true; /opt/venv/bin/python -c 'import os,sys; print(\"cwd\", os.getcwd()); print(\"sys.path\", sys.path)' || true; /opt/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --app-dir /app"
   }
 }

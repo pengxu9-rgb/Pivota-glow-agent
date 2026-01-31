@@ -313,7 +313,35 @@ def _aurora_profile_sentence(
         if isinstance(concerns_raw, list):
             concerns = [str(c) for c in concerns_raw if c]
 
-    concerns_str = ", ".join(concerns) if concerns else "none"
+    # Map front-end concern IDs to keywords Aurora's routine planner reliably detects.
+    # (Aurora's current clarify logic is keyword-based; include bilingual hints for robustness.)
+    alias_map = {
+        "acne": "acne (痘痘)",
+        "dark_spots": "dark spots / hyperpigmentation (淡斑/痘印)",
+        "dullness": "brightening (提亮/美白)",
+        "wrinkles": "anti-aging (抗老/细纹)",
+        "aging": "anti-aging (抗老/细纹)",
+        "pores": "closed comedones / rough texture (闭口/黑头/粗糙)",
+        "redness": "redness / sensitive skin (泛红敏感)",
+        "dehydration": "hydration + repair (补水修护)",
+        "repair": "barrier repair (屏障修护)",
+        "barrier": "barrier repair (屏障修护)",
+    }
+
+    normalized: list[str] = []
+    for c in concerns:
+        key = c.strip().lower()
+        normalized.append(alias_map.get(key, c))
+    # Preserve order but remove duplicates.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for c in normalized:
+        if c in seen:
+            continue
+        seen.add(c)
+        deduped.append(c)
+
+    concerns_str = ", ".join(deduped) if deduped else "none"
     skin_str = str(skin_type or "unknown")
     return f"User profile: skin type {skin_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
 

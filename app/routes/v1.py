@@ -1043,8 +1043,37 @@ async def chat(
 
     answer = payload.get("answer") if isinstance(payload, dict) else None
     intent = payload.get("intent") if isinstance(payload, dict) else None
+    llm_error = payload.get("llm_error") if isinstance(payload, dict) else None
     clarification = payload.get("clarification") if isinstance(payload, dict) else None
     context = payload.get("context") if isinstance(payload, dict) else None
+
+    # Aurora sometimes falls back to a short, non-English canned answer when the LLM output is too short.
+    # For EN users, translate the fallback into English so the experience remains bilingual.
+    if (
+        lang_code == "EN"
+        and intent != "clarify"
+        and isinstance(llm_error, str)
+        and llm_error
+        and isinstance(answer, str)
+        and any("\u4e00" <= ch <= "\u9fff" for ch in answer)
+    ):
+        try:
+            translation = await aurora_chat(
+                base_url=AURORA_DECISION_BASE_URL,
+                query=(
+                    "Translate the following text into English. Keep the bullet formatting.\n"
+                    "IMPORTANT: Reply ONLY in English. Do not use Chinese.\n\n"
+                    f"TEXT:\n{answer}"
+                ),
+                timeout_s=DEFAULT_TIMEOUT_S,
+                llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
+                llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
+            )
+            translated_answer = translation.get("answer") if isinstance(translation, dict) else None
+            if isinstance(translated_answer, str) and translated_answer.strip():
+                answer = translated_answer
+        except Exception as exc:
+            logger.warning("Fallback translation failed. err=%s", exc)
 
     if intent == "clarify":
         clarification = _normalize_clarification(clarification, language=lang_code)

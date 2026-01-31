@@ -1047,13 +1047,11 @@ async def chat(
     clarification = payload.get("clarification") if isinstance(payload, dict) else None
     context = payload.get("context") if isinstance(payload, dict) else None
 
-    # Aurora sometimes falls back to a short, non-English canned answer when the LLM output is too short.
-    # For EN users, translate the fallback into English so the experience remains bilingual.
+    # Aurora sometimes replies in Chinese even for EN users (including fallback answers).
+    # For EN users, translate into English so the experience remains bilingual.
     if (
         lang_code == "EN"
         and intent != "clarify"
-        and isinstance(llm_error, str)
-        and llm_error
         and isinstance(answer, str)
         and any("\u4e00" <= ch <= "\u9fff" for ch in answer)
     ):

@@ -1010,10 +1010,19 @@ async def chat(
         reply_language = "Simplified Chinese"
 
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
-    reply_instruction = "IMPORTANT: Reply ONLY in English." if lang_code == "EN" else "请只用简体中文回答。"
+    reply_instruction = (
+        "IMPORTANT: Reply ONLY in English. Do not use Chinese."
+        if lang_code == "EN"
+        else "请只用简体中文回答，不要使用英文。"
+    )
     if isinstance(anchor_product_id, str) and anchor_product_id.strip():
         profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
-        query = f"{sys_prompt}{profile}\nQuestion: {message.strip()}\n{reply_instruction}"
+        query = (
+            f"{sys_prompt}{profile}\n"
+            f"User question: {message.strip()}\n"
+            "Please give a detailed product-fit assessment (suitability, risks/cautions, how to use, and 1–2 alternatives).\n"
+            f"{reply_instruction}"
+        )
     else:
         profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
         query = f"{sys_prompt}{profile}\nUser message: {message.strip()}\n{reply_instruction}"

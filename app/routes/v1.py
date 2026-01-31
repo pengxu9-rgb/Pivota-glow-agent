@@ -466,6 +466,10 @@ def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"
                 "question": "你的肤质更接近哪一种？",
                 "options": ["油皮", "干皮", "混合皮", "敏感肌", "不确定"],
             },
+            "barrier_status": {
+                "question": "你最近是否有刺痛/泛红/爆皮（可能屏障受损）？",
+                "options": ["没有", "轻微", "明显（刺痛/泛红）", "不确定"],
+            },
             "concerns": {
                 "question": "你最想优先解决的 1-2 个问题是？",
                 "options": ["闭口/黑头", "痘痘", "暗沉/美白", "泛红敏感", "抗老", "补水修护"],
@@ -480,6 +484,10 @@ def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"
             "skin_type": {
                 "question": "Which skin type fits you best?",
                 "options": ["Oily", "Dry", "Combination", "Sensitive", "Not sure"],
+            },
+            "barrier_status": {
+                "question": "Lately, do you get stinging/redness/flaking (possible barrier stress)?",
+                "options": ["No", "Mild", "Yes (stinging/redness)", "Not sure"],
             },
             "concerns": {
                 "question": "What are your top 1–2 priorities right now?",

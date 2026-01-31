@@ -664,11 +664,21 @@ async def routine_reorder(
 
     async def _aurora_routine_for_budget(budget: str) -> Optional[dict[str, Any]]:
         try:
+            preference_note = (
+                "Prefer cheaper options"
+                if preference in {"pref_cheaper", "cheaper", "cheap"}
+                else "Prefer gentler / lower irritation"
+                  if preference in {"pref_gentler", "gentler", "gentle"}
+                  else "Prefer fastest delivery"
+                    if preference in {"pref_fastest_delivery", "fastest_delivery"}
+                    else "No special preference"
+            )
             payload = await aurora_chat(
                 base_url=AURORA_DECISION_BASE_URL,
                 query=(
-                    f"{_aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
-                    f"Preference: {preference}. Reply in English."
+                    f"{_aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
+                    f"Preference: {preference_note}.\n"
+                    "Please recommend a simple AM/PM skincare routine within my budget. Reply in English."
                 ),
                 timeout_s=DEFAULT_TIMEOUT_S,
             )

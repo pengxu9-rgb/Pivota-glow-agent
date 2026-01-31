@@ -531,6 +531,71 @@ def _analysis_from_aurora_context(
 
     return base
 
+
+def _looks_like_routine_request(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return False
+
+    # Avoid over-triggering on single-product questions (handled via anchor flow).
+    product_q = any(k in t for k in ["this product", "this skincare", "this one", "is it good", "is it ok"]) or any(
+        k in text for k in ["这款", "这个产品", "适合吗", "能用吗"]
+    )
+    if product_q:
+        return False
+
+    return any(
+        k in t
+        for k in [
+            "routine",
+            "regimen",
+            "am/pm",
+            "morning and night",
+            "skincare steps",
+            "skin care steps",
+            "what should i use",
+            "what should i buy",
+            "build me",
+            "recommend a routine",
+            "simple routine",
+            "simple regimen",
+        ]
+    ) or any(k in text for k in ["护肤流程", "护肤步骤", "早晚", "一套护肤", "搭配", "步骤", "护肤方案"])
+
+
+def _looks_like_current_products_review_request(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return False
+
+    return any(
+        k in t
+        for k in [
+            "review my products",
+            "review my skincare",
+            "check my products",
+            "check my skincare",
+            "analyze my products",
+            "analyse my products",
+            "what i'm using",
+            "what i am using",
+            "current products",
+            "current regimen",
+            "existing products",
+        ]
+    ) or any(k in text for k in ["评估我现在用", "分析我现在用", "看看我现在用", "我现在用的护肤品", "现有产品", "现在用的产品"])
+
+
+def _is_no_products_reply(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return False
+
+    if any(k in t for k in ["none", "no products", "no routine", "start fresh", "from scratch"]):
+        return True
+    return any(k in text for k in ["没有", "无", "从零开始", "不用", "没用"])
+
+
 def _looks_like_reco_rationale_request(text: str) -> bool:
     """
     Detect follow-ups like "why these recommendations / what evidence?" so we can
@@ -923,6 +988,14 @@ async def routine_reorder(
     intent_id = stored.get("intent_id") or body.get("intent_id") or "routine"
     diagnosis_payload = stored.get("diagnosis") if isinstance(stored.get("diagnosis"), dict) else None
     analysis_payload = stored.get("analysis") if isinstance(stored.get("analysis"), dict) else None
+    current_products_text = stored.get("current_products_text") if isinstance(stored.get("current_products_text"), str) else None
+
+    goal_map = {
+        "routine": "a simple, safe daily skincare regimen",
+        "breakouts": "reduce breakouts/acne with minimal irritation",
+        "brightening": "brighten and fade dark spots with low irritation",
+    }
+    goal_note = goal_map.get(str(intent_id).strip().lower(), str(intent_id or "a simple skincare regimen"))
 
     # Default seed queries (fallback only). We run one product search per category,
     # then pick a "premium" and "dupe" by price from the result set.
@@ -993,10 +1066,17 @@ async def routine_reorder(
                     if preference in {"pref_fastest_delivery", "fastest_delivery"}
                     else "No special preference"
             )
+            products_note = ""
+            if current_products_text:
+                products_note = (
+                    f"Current products (try to reuse what fits; suggest minimal replacements): {current_products_text[:1200]}\n"
+                )
             payload = await aurora_chat(
                 base_url=AURORA_DECISION_BASE_URL,
                 query=(
                     f"{_aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
+                    f"Goal: {goal_note}.\n"
+                    f"{products_note}"
                     f"Preference: {preference_note}.\n"
                     "Please recommend a simple AM/PM skincare routine within my budget. Reply in English."
                 ),
@@ -1429,22 +1509,92 @@ async def chat(
         lang_code = "CN"
         reply_language = "Simplified Chinese"
 
+    pending = stored.get("pending_clarification")
+    pending_user_request = stored.get("pending_user_request") if isinstance(stored.get("pending_user_request"), str) else None
+    current_products_text = stored.get("current_products_text") if isinstance(stored.get("current_products_text"), str) else None
+
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
     reply_instruction = (
         "IMPORTANT: Reply ONLY in English. Do not use Chinese."
         if lang_code == "EN"
         else "请只用简体中文回答，不要使用英文。"
     )
+
+    # Multi-turn: when we ask the user to list their current products, the next
+    # message is treated as the product list and we answer the *original* request.
+    effective_message = message.strip()
+    if pending == "current_products":
+        provided = "" if _is_no_products_reply(effective_message) else effective_message
+        current_products_text = provided[:4000] if provided else None
+
+        effective_message = (
+            pending_user_request
+            or (
+                "Please review my current skincare products and tell me what to keep/change before recommending anything."
+                if lang_code == "EN"
+                else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
+            )
+        )
+
+        await SESSION_STORE.upsert(
+            brief_id,
+            {
+                "trace_id": x_trace_id,
+                "pending_clarification": None,
+                "pending_user_request": None,
+                "current_products_text": current_products_text,
+            },
+        )
+
+    elif (
+        (_looks_like_current_products_review_request(effective_message) or _looks_like_routine_request(effective_message))
+        and not current_products_text
+        and not anchor_product_id
+        and not anchor_product_url
+    ):
+        # Ask for product history first so we can evaluate what the user already uses
+        # instead of jumping straight into blind recommendations.
+        await SESSION_STORE.upsert(
+            brief_id,
+            {
+                "trace_id": x_trace_id,
+                "pending_clarification": "current_products",
+                "pending_user_request": effective_message[:2000],
+            },
+        )
+
+        if lang_code == "CN":
+            question = (
+                "在推荐之前，我想先评估你现在用的护肤品是否适合。\n"
+                "请把你正在用的产品按步骤列出来（洁面/精华/保湿/防晒/处方药等），或者回复“无/从零开始”。"
+            )
+            options = ["无 / 从零开始"]
+            answer = "为了给你更准确的建议，我需要先确认一件事："
+        else:
+            question = (
+                "Before I recommend anything, I want to evaluate what you’re already using.\n"
+                "Please list your current products by step (cleanser/actives/moisturizer/SPF/any prescriptions), or reply “none / start fresh”."
+            )
+            options = ["None / start fresh"]
+            answer = "One quick question so I can answer accurately:"
+
+        return {
+            "answer": answer,
+            "intent": "clarify",
+            "clarification": {"questions": [{"id": "current_products", "question": question, "options": options}], "missing_fields": ["current_products"]},
+            "context": None,
+        }
+
     if isinstance(anchor_product_id, str) and anchor_product_id.strip():
         profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
         query = (
             f"{sys_prompt}{profile}\n"
-            f"User question: {message.strip()}\n"
+            f"User question: {effective_message}\n"
             "Please give a detailed product-fit assessment (suitability, risks/cautions, how to use, and 1–2 alternatives).\n"
             f"{reply_instruction}"
         )
     else:
-        if _looks_like_reco_rationale_request(message) and isinstance(stored.get("aurora_context"), dict):
+        if _looks_like_reco_rationale_request(effective_message) and isinstance(stored.get("aurora_context"), dict):
             explained = _explain_routine_from_aurora_context(stored["aurora_context"], language=lang_code)
             if explained:
                 return {
@@ -1455,7 +1605,8 @@ async def chat(
                 }
 
         profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
-        query = f"{sys_prompt}{profile}\nUser message: {message.strip()}\n{reply_instruction}"
+        products_block = f"\ncurrent_products={current_products_text}\n" if current_products_text else ""
+        query = f"{sys_prompt}{profile}{products_block}\nUser message: {effective_message}\n{reply_instruction}"
 
     try:
         payload = await aurora_chat(
@@ -1514,7 +1665,7 @@ async def chat(
         brief_id,
         {
             "trace_id": x_trace_id,
-            "last_user_message": message.strip()[:2000],
+            "last_user_message": effective_message[:2000],
             "last_aurora_intent": intent,
             "last_aurora_answer": answer,
             "aurora_context": context if isinstance(context, dict) else None,

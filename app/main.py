@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +18,37 @@ def _parse_cors_origins(raw: Optional[str]) -> list[str]:
         return ["*"]
     parts = [p.strip() for p in raw.split(",")]
     return [p for p in parts if p]
+
+
+def _build_allow_origin_regex(origins: list[str]) -> Optional[str]:
+    patterns: list[str] = []
+    for origin in origins:
+        try:
+            parsed = urlparse(origin)
+        except Exception:
+            continue
+
+        if not parsed.scheme or not parsed.hostname:
+            continue
+
+        host = parsed.hostname
+        if not host.endswith(".vercel.app"):
+            continue
+
+        base = host[: -len(".vercel.app")]
+        if not base:
+            continue
+
+        # Allow Vercel preview URLs for the same project, e.g.
+        # - https://<project>.vercel.app
+        # - https://<project>-git-main-<team>.vercel.app
+        # - https://<project>-<hash>.vercel.app
+        patterns.append(rf"{re.escape(parsed.scheme)}://{re.escape(base)}(-.*)?\\.vercel\\.app")
+
+    if not patterns:
+        return None
+
+    return rf"^(?:{'|'.join(patterns)})$"
 
 
 def _setup_logging() -> None:
@@ -32,6 +65,7 @@ def create_app() -> FastAPI:
 
     origins = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
     allow_all = "*" in origins
+    allow_origin_regex = None if allow_all else _build_allow_origin_regex(origins)
 
     app.add_middleware(
         CORSMiddleware,
@@ -39,6 +73,7 @@ def create_app() -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_origin_regex=allow_origin_regex,
         max_age=86400,
     )
 

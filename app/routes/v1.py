@@ -256,7 +256,12 @@ async def _find_products_with_category(
     # Prefer category-looking hits; if none, return raw list to allow price-based picking.
     scored.sort(key=lambda x: x[0], reverse=True)
     positive = [p for s, p in scored if s > 0]
-    selected = positive if positive else [p for _, p in scored]
+    if positive:
+        # Keep positives first, but preserve the full candidate set so exact title/brand matches
+        # are still possible even when category scoring is imperfect.
+        selected = positive + [p for s, p in scored if s <= 0]
+    else:
+        selected = [p for _, p in scored]
 
     async with _PRODUCT_SEARCH_LOCK:
         _PRODUCT_SEARCH_CACHE[cache_key] = (now_ms, selected)

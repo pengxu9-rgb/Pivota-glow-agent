@@ -1519,6 +1519,7 @@ async def chat(
 
     pending = stored.get("pending_clarification")
     pending_user_request = stored.get("pending_user_request") if isinstance(stored.get("pending_user_request"), str) else None
+    pending_request_kind = stored.get("pending_request_kind") if isinstance(stored.get("pending_request_kind"), str) else None
     current_products_text = stored.get("current_products_text") if isinstance(stored.get("current_products_text"), str) else None
 
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
@@ -1531,18 +1532,30 @@ async def chat(
     # Multi-turn: when we ask the user to list their current products, the next
     # message is treated as the product list and we answer the *original* request.
     effective_message = message.strip()
+    products_review_mode = False
     if pending == "current_products":
         provided = "" if _is_no_products_reply(effective_message) else effective_message
         current_products_text = provided[:4000] if provided else None
 
-        effective_message = (
-            pending_user_request
-            or (
-                "Please review my current skincare products and tell me what to keep/change before recommending anything."
+        kind = str(pending_request_kind or "").strip().lower()
+        if kind == "routine":
+            base = pending_user_request or ""
+            sanitized = re.sub(r"\broutine\b", "regimen", base, flags=re.IGNORECASE).strip()
+            effective_message = sanitized or (
+                "Please propose a simple AM/PM skincare regimen based on my profile."
                 if lang_code == "EN"
-                else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
+                else "请基于我的情况给一套简单的早晚护肤方案（尽量温和）。"
             )
-        )
+        else:
+            effective_message = (
+                pending_user_request
+                or (
+                    "Please review my current skincare products and tell me what to keep/change before recommending anything."
+                    if lang_code == "EN"
+                    else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
+                )
+            )
+        products_review_mode = True
 
         await SESSION_STORE.upsert(
             brief_id,
@@ -1550,6 +1563,7 @@ async def chat(
                 "trace_id": x_trace_id,
                 "pending_clarification": None,
                 "pending_user_request": None,
+                "pending_request_kind": None,
                 "current_products_text": current_products_text,
             },
         )
@@ -1562,12 +1576,14 @@ async def chat(
     ):
         # Ask for product history first so we can evaluate what the user already uses
         # instead of jumping straight into blind recommendations.
+        kind = "review" if _looks_like_current_products_review_request(effective_message) else "routine"
         await SESSION_STORE.upsert(
             brief_id,
             {
                 "trace_id": x_trace_id,
                 "pending_clarification": "current_products",
                 "pending_user_request": effective_message[:2000],
+                "pending_request_kind": kind,
             },
         )
 
@@ -1612,9 +1628,27 @@ async def chat(
                     "context": stored.get("aurora_context"),
                 }
 
-        profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
-        products_block = f"\ncurrent_products={current_products_text}\n" if current_products_text else ""
-        query = f"{sys_prompt}{profile}{products_block}\nUser message: {effective_message}\n{reply_instruction}"
+        if current_products_text and (_looks_like_current_products_review_request(effective_message) or _looks_like_routine_request(effective_message)):
+            products_review_mode = True
+
+        if products_review_mode and current_products_text:
+            profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
+            query = (
+                f"{sys_prompt}{profile}\n"
+                f"current_products={current_products_text}\n"
+                f"User request: {effective_message}\n"
+                "Task:\n"
+                "1) Evaluate each listed product: keep/adjust/replace + a short reason.\n"
+                "2) Call out conflicts/irritation risks and how to use safely.\n"
+                "3) Then propose a minimal AM/PM skincare regimen that reuses the kept products.\n"
+                "4) Only suggest 1–2 new additions if truly necessary; keep it budget-aware.\n"
+                "5) Use a natural chat style. Do NOT use a rigid template like “Part 1/Part 2/Part 3/Part 4”.\n"
+                f"{reply_instruction}"
+            )
+        else:
+            profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
+            products_block = f"\ncurrent_products={current_products_text}\n" if current_products_text else ""
+            query = f"{sys_prompt}{profile}{products_block}\nUser message: {effective_message}\n{reply_instruction}"
 
     try:
         payload = await aurora_chat(

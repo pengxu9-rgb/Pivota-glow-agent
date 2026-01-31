@@ -462,6 +462,10 @@ def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"
                 "question": "你想评估的具体产品是？",
                 "options": ["发产品名（品牌 + 名称）", "粘贴购买链接", "上传产品照片/成分表"],
             },
+            "skin_type": {
+                "question": "你的肤质更接近哪一种？",
+                "options": ["油皮", "干皮", "混合皮", "敏感肌", "不确定"],
+            },
             "concerns": {
                 "question": "你最想优先解决的 1-2 个问题是？",
                 "options": ["闭口/黑头", "痘痘", "暗沉/美白", "泛红敏感", "抗老", "补水修护"],
@@ -472,6 +476,10 @@ def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"
             "anchor": {
                 "question": "Which exact product do you want to evaluate?",
                 "options": ["Send the product name (brand + name)", "Paste a product link", "Upload a product photo/ingredients"],
+            },
+            "skin_type": {
+                "question": "Which skin type fits you best?",
+                "options": ["Oily", "Dry", "Combination", "Sensitive", "Not sure"],
             },
             "concerns": {
                 "question": "What are your top 1–2 priorities right now?",

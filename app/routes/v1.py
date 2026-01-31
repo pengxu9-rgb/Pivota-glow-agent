@@ -296,6 +296,7 @@ def _best_product_match(
         return None
 
     brand_norm = _normalize_match_text(brand_hint or "")
+    brand_required = brand_norm and brand_norm not in {"unknown", "aurora", "premium", "dupe"}
     best: tuple[float, dict[str, Any]] | None = None
 
     for cand in candidates:
@@ -307,9 +308,12 @@ def _best_product_match(
         if not title_norm:
             continue
 
+        if brand_required and brand_norm not in title_norm:
+            continue
+
         ratio = difflib.SequenceMatcher(a=desired_norm, b=title_norm).ratio()
         cat_score = float(_score_product_for_category(category, cand))
-        brand_bonus = 0.15 if brand_norm and brand_norm in title_norm else 0.0
+        brand_bonus = 0.2 if brand_norm and brand_norm in title_norm else 0.0
 
         score = ratio + (cat_score * 0.06) + brand_bonus
         if best is None or score > best[0]:

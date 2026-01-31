@@ -13,6 +13,8 @@ async def aurora_chat(
     timeout_s: float,
     llm_provider: Optional[str] = None,
     llm_model: Optional[str] = None,
+    anchor_product_id: Optional[str] = None,
+    anchor_product_url: Optional[str] = None,
 ) -> dict[str, Any]:
     url = f"{base_url.rstrip('/')}/api/chat"
     payload: dict[str, Any] = {"query": query}
@@ -20,6 +22,10 @@ async def aurora_chat(
         payload["llm_provider"] = llm_provider
     if llm_model:
         payload["llm_model"] = llm_model
+    if anchor_product_id:
+        payload["anchor_product_id"] = anchor_product_id
+    if anchor_product_url:
+        payload["anchor_product_url"] = anchor_product_url
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         res = await client.post(url, json=payload)
@@ -86,4 +92,3 @@ def _extract_braced(text: str, start: int) -> Optional[str]:
     if end is None or depth != 0:
         return None
     return text[start : end + 1]
-

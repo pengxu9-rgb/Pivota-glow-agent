@@ -982,6 +982,8 @@ async def chat(
     budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
     budget = _budget_tier_to_aurora_budget(budget_tier)
     language = body.get("language")
+    anchor_product_id = body.get("anchor_product_id") or body.get("anchorProductId")
+    anchor_product_url = body.get("anchor_product_url") or body.get("anchorProductUrl")
     lang_code: Literal["EN", "CN"] = "EN"
     reply_language = "English"
     if isinstance(language, str) and language.strip().upper() in {"CN", "ZH", "ZH-CN", "ZH_HANS"}:
@@ -998,6 +1000,8 @@ async def chat(
             timeout_s=DEFAULT_TIMEOUT_S,
             llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
             llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
+            anchor_product_id=str(anchor_product_id).strip() if isinstance(anchor_product_id, str) and anchor_product_id.strip() else None,
+            anchor_product_url=str(anchor_product_url).strip() if isinstance(anchor_product_url, str) and anchor_product_url.strip() else None,
         )
     except Exception as exc:
         logger.error("Aurora chat failed. err=%s", exc)

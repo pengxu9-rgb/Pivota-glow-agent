@@ -395,7 +395,9 @@ def _aurora_profile_line(
     routine_str = str(current_routine or "basic")
 
     return (
-        f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; currentRoutine={routine_str}."
+        # NOTE: Avoid the substring "routine" in this line because Aurora's /api/chat
+        # intent heuristics treat any mention of "routine" as a routine request.
+        f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; current_regimen={routine_str}."
     )
 
 def _aurora_profile_sentence(
@@ -528,6 +530,181 @@ def _analysis_from_aurora_context(
         base["features"] = merged_features[:6]
 
     return base
+
+def _looks_like_rationale_request(text: str) -> bool:
+    t = text.lower()
+    en = [
+        "why",
+        "reason",
+        "rationale",
+        "evidence",
+        "scientific",
+        "science",
+        "mechanism",
+        "based on",
+        "how does",
+        "how do",
+        "explain",
+    ]
+    cn = [
+        "为什么",
+        "为啥",
+        "原因",
+        "依据",
+        "科学",
+        "原理",
+        "机制",
+        "证据",
+        "怎么",
+        "解释",
+    ]
+    return any(k in t for k in en) or any(k in text for k in cn)
+
+
+def _bucket_strength(val: Any) -> str:
+    try:
+        v = float(val)
+    except Exception:
+        return "unknown"
+    if v >= 0.75:
+        return "high"
+    if v >= 0.45:
+        return "medium"
+    if v > 0:
+        return "low"
+    return "unknown"
+
+
+def _format_strength(label: str, strength: str, *, language: Literal["EN", "CN"]) -> str:
+    if language == "CN":
+        mapping = {"high": "高", "medium": "中", "low": "低", "unknown": "未知"}
+        return f"{label}：{mapping.get(strength, '未知')}"
+    mapping = {"high": "high", "medium": "medium", "low": "low", "unknown": "unknown"}
+    return f"{label}: {mapping.get(strength, 'unknown')}"
+
+
+def _explain_routine_from_aurora_context(
+    aurora_context: dict[str, Any],
+    *,
+    language: Literal["EN", "CN"],
+) -> Optional[str]:
+    routine = aurora_context.get("routine")
+    if not isinstance(routine, dict):
+        routine = aurora_context.get("routine_primary") if isinstance(aurora_context.get("routine_primary"), dict) else None
+    if not isinstance(routine, dict):
+        return None
+
+    am = routine.get("am")
+    pm = routine.get("pm")
+    steps_am = am if isinstance(am, list) else []
+    steps_pm = pm if isinstance(pm, list) else []
+    if not steps_am and not steps_pm:
+        return None
+
+    detected = aurora_context.get("detected") if isinstance(aurora_context.get("detected"), dict) else {}
+
+    if language == "CN":
+        lines: list[str] = []
+        lines.append("下面是“为什么推荐这些”的科学解释（按功效机制 + 风险/兼容性来讲）：")
+        if detected:
+            parts = []
+            if detected.get("oily_acne") is True:
+                parts.append("偏油/易长痘")
+            if detected.get("sensitive_skin") is True:
+                parts.append("偏敏感")
+            if detected.get("barrier_impaired") is True:
+                parts.append("屏障可能受损")
+            if parts:
+                lines.append(f"你的画像要点：{ '、'.join(parts) }。")
+        lines.append("")
+    else:
+        lines = []
+        lines.append("Here’s the scientific rationale for the current recommendations (mechanism + safety + routine-fit):")
+        if detected:
+            parts = []
+            if detected.get("oily_acne") is True:
+                parts.append("oily/acne-prone tendency")
+            if detected.get("sensitive_skin") is True:
+                parts.append("sensitive/reactive tendency")
+            if detected.get("barrier_impaired") is True:
+                parts.append("possible barrier stress")
+            if parts:
+                lines.append(f"Your profile signals: {', '.join(parts)}.")
+        lines.append("")
+
+    def explain_steps(title: str, steps: list[dict[str, Any]]) -> None:
+        if language == "CN":
+            lines.append(title)
+        else:
+            lines.append(title)
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            sku = step.get("sku") if isinstance(step.get("sku"), dict) else {}
+            brand = str(sku.get("brand") or "").strip()
+            name = str(sku.get("name") or "").strip()
+            display = " ".join([p for p in [brand, name] if p]).strip() or "Unknown product"
+
+            mech = sku.get("mechanism") if isinstance(sku.get("mechanism"), dict) else {}
+            strengths: list[str] = []
+            if mech:
+                # Keep labels minimal and user-friendly.
+                mapping = [
+                    ("oil_control", "控油" if language == "CN" else "Oil control"),
+                    ("acne_comedonal", "痘痘/闭口" if language == "CN" else "Acne/comedones"),
+                    ("soothing", "舒缓" if language == "CN" else "Soothing"),
+                    ("repair", "修护" if language == "CN" else "Barrier repair"),
+                    ("brightening", "提亮" if language == "CN" else "Brightening"),
+                ]
+                for key, label in mapping:
+                    if key in mech:
+                        strengths.append(_format_strength(label, _bucket_strength(mech.get(key)), language=language))
+
+            risk_flags = sku.get("risk_flags")
+            risks: list[str] = []
+            if isinstance(risk_flags, list):
+                for rf in risk_flags:
+                    if rf == "high_irritation":
+                        risks.append("刺激性偏高" if language == "CN" else "Higher irritation risk")
+                    elif rf:
+                        risks.append(str(rf))
+
+            notes = step.get("notes")
+            note_text = ""
+            if isinstance(notes, list) and notes:
+                note_text = " ".join(str(n) for n in notes if n)
+
+            if language == "CN":
+                lines.append(f"- {display}")
+                if strengths:
+                    lines.append(f"  - 机制匹配：{'; '.join(strengths)}")
+                if note_text:
+                    lines.append(f"  - 目的：{note_text}")
+                if risks:
+                    lines.append(f"  - 注意：{'; '.join(risks)}（先从低频开始，耐受后再加）")
+            else:
+                lines.append(f"- {display}")
+                if strengths:
+                    lines.append(f"  - Mechanism fit: {'; '.join(strengths)}")
+                if note_text:
+                    lines.append(f"  - Purpose: {note_text}")
+                if risks:
+                    lines.append(f"  - Cautions: {'; '.join(risks)} (start low frequency and titrate)")
+
+        lines.append("")
+
+    explain_steps("🌞 AM" if language == "EN" else "🌞 早上（AM）", steps_am)
+    explain_steps("🌙 PM" if language == "EN" else "🌙 晚上（PM）", steps_pm)
+
+    if language == "CN":
+        lines.append("如果你想要“更严格的科学依据/引用”，请点名其中某一款产品（或发链接/成分表），我可以逐条拆解其成分→作用机制→风险点。")
+    else:
+        lines.append(
+            "If you want stricter evidence with ingredient-by-ingredient justification, name one product (or paste a link/ingredients) and I’ll break down MoA, safety flags, and conflicts."
+        )
+
+    return "\n".join(lines).strip()
 
 def _require_brief_id(x_brief_id: Optional[str]) -> str:
     if not x_brief_id:
@@ -1252,6 +1429,16 @@ async def chat(
             f"{reply_instruction}"
         )
     else:
+        if _looks_like_rationale_request(message) and isinstance(stored.get("aurora_context"), dict):
+            explained = _explain_routine_from_aurora_context(stored["aurora_context"], language=lang_code)
+            if explained:
+                return {
+                    "answer": explained,
+                    "intent": "explain",
+                    "clarification": None,
+                    "context": stored.get("aurora_context"),
+                }
+
         profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
         query = f"{sys_prompt}{profile}\nUser message: {message.strip()}\n{reply_instruction}"
 

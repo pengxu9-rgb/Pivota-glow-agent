@@ -29,6 +29,7 @@ GLOW_SYSTEM_PROMPT = (os.getenv("GLOW_SYSTEM_PROMPT") or "").strip()
 USE_PIVOTA_AGENT_SEARCH = (os.getenv("USE_PIVOTA_AGENT_SEARCH") or "").strip().lower() in {"1", "true", "yes", "y"}
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
+OFFERS_RESOLVE_TIMEOUT_S = float(os.getenv("OFFERS_RESOLVE_TIMEOUT_S") or "55")
 
 # Best-effort cache for product lookups so repeated checkout clicks are fast.
 _PRODUCT_SEARCH_TTL_MS = int(float(os.getenv("PRODUCT_SEARCH_CACHE_TTL_SECONDS") or "3600") * 1000)
@@ -238,7 +239,7 @@ async def _find_products_with_category(
             timeout_s=timeout_s,
         )
     except Exception as exc:
-        logger.warning("Product search failed. query=%r err=%s", query, exc)
+        logger.warning("Product search failed. query=%r err=%r", query, exc)
         return []
 
     products = result.get("products")
@@ -1119,7 +1120,7 @@ async def offers_resolve(
                 desired,
                 category=category,
                 limit=24,
-                timeout_s=DEFAULT_TIMEOUT_S,
+                timeout_s=OFFERS_RESOLVE_TIMEOUT_S,
             )
 
         best = _best_product_match(desired, category=category, candidates=candidates, brand_hint=brand)

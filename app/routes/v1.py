@@ -298,6 +298,25 @@ def _aurora_profile_line(
         f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; currentRoutine={routine_str}."
     )
 
+def _aurora_profile_sentence(
+    *,
+    diagnosis: Optional[dict[str, Any]],
+    market: str,
+    budget: str,
+) -> str:
+    skin_type = None
+    concerns: list[str] = []
+
+    if isinstance(diagnosis, dict):
+        skin_type = diagnosis.get("skinType") or diagnosis.get("skin_type")
+        concerns_raw = diagnosis.get("concerns")
+        if isinstance(concerns_raw, list):
+            concerns = [str(c) for c in concerns_raw if c]
+
+    concerns_str = ", ".join(concerns) if concerns else "none"
+    skin_str = str(skin_type or "unknown")
+    return f"User profile: skin type {skin_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
+
 def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"]) -> Any:
     if not isinstance(clarification, dict):
         return clarification
@@ -990,13 +1009,19 @@ async def chat(
         lang_code = "CN"
         reply_language = "Simplified Chinese"
 
-    profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
+    reply_instruction = "IMPORTANT: Reply ONLY in English." if lang_code == "EN" else "请只用简体中文回答。"
+    if isinstance(anchor_product_id, str) and anchor_product_id.strip():
+        profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
+        query = f"{sys_prompt}{profile}\nQuestion: {message.strip()}\n{reply_instruction}"
+    else:
+        profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
+        query = f"{sys_prompt}{profile}\nUser message: {message.strip()}\n{reply_instruction}"
 
     try:
         payload = await aurora_chat(
             base_url=AURORA_DECISION_BASE_URL,
-            query=f"{sys_prompt}{profile}\nUser message: {message.strip()}\nReply in {reply_language}.",
+            query=query,
             timeout_s=DEFAULT_TIMEOUT_S,
             llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
             llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,

@@ -228,8 +228,6 @@ async def _find_products_with_category(
             "limit": max(1, min(limit, 50)),
             "in_stock_only": False,
         }
-        if cat_hint:
-            search_payload["category"] = cat_hint
 
         result = await _agent_invoke(
             "find_products_multi",

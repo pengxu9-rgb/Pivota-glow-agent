@@ -43,7 +43,7 @@ def _build_allow_origin_regex(origins: list[str]) -> Optional[str]:
         # - https://<project>.vercel.app
         # - https://<project>-git-main-<team>.vercel.app
         # - https://<project>-<hash>.vercel.app
-        patterns.append(rf"{re.escape(parsed.scheme)}://{re.escape(base)}(-.*)?\\.vercel\\.app")
+        patterns.append(rf"{re.escape(parsed.scheme)}://{re.escape(base)}(-.*)?\.vercel\.app")
 
     if not patterns:
         return None

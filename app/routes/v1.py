@@ -531,34 +531,49 @@ def _analysis_from_aurora_context(
 
     return base
 
-def _looks_like_rationale_request(text: str) -> bool:
-    t = text.lower()
-    en = [
-        "why",
-        "reason",
-        "rationale",
-        "evidence",
-        "scientific",
-        "science",
-        "mechanism",
-        "based on",
-        "how does",
-        "how do",
-        "explain",
-    ]
-    cn = [
-        "为什么",
-        "为啥",
-        "原因",
-        "依据",
-        "科学",
-        "原理",
-        "机制",
-        "证据",
-        "怎么",
-        "解释",
-    ]
-    return any(k in t for k in en) or any(k in text for k in cn)
+def _looks_like_reco_rationale_request(text: str) -> bool:
+    """
+    Detect follow-ups like "why these recommendations / what evidence?" so we can
+    explain the *current* recommended plan instead of generating a new one.
+    """
+
+    t = text.strip().lower()
+    if not t:
+        return False
+
+    asks_why_or_evidence = any(
+        k in t
+        for k in [
+            "why",
+            "reason",
+            "rationale",
+            "evidence",
+            "scientific",
+            "science",
+            "based on",
+            "explain",
+        ]
+    ) or any(k in text for k in ["为什么", "为啥", "原因", "依据", "科学", "证据", "解释"])
+
+    refers_to_recos = any(
+        k in t
+        for k in [
+            "recommend",
+            "recommendation",
+            "recommended",
+            "these",
+            "those",
+            "picked",
+            "choose",
+            "this plan",
+            "this regimen",
+            "this routine",
+            "your picks",
+            "your choices",
+        ]
+    ) or any(k in text for k in ["推荐", "这些", "那这些", "这套", "这组", "你选", "为什么选"])
+
+    return asks_why_or_evidence and refers_to_recos
 
 
 def _bucket_strength(val: Any) -> str:
@@ -1429,7 +1444,7 @@ async def chat(
             f"{reply_instruction}"
         )
     else:
-        if _looks_like_rationale_request(message) and isinstance(stored.get("aurora_context"), dict):
+        if _looks_like_reco_rationale_request(message) and isinstance(stored.get("aurora_context"), dict):
             explained = _explain_routine_from_aurora_context(stored["aurora_context"], language=lang_code)
             if explained:
                 return {

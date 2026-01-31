@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import os
+import re
 import time
 import uuid
 import urllib.parse
@@ -27,6 +29,11 @@ GLOW_SYSTEM_PROMPT = (os.getenv("GLOW_SYSTEM_PROMPT") or "").strip()
 USE_PIVOTA_AGENT_SEARCH = (os.getenv("USE_PIVOTA_AGENT_SEARCH") or "").strip().lower() in {"1", "true", "yes", "y"}
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
+
+# Best-effort cache for product lookups so repeated checkout clicks are fast.
+_PRODUCT_SEARCH_TTL_MS = int(float(os.getenv("PRODUCT_SEARCH_CACHE_TTL_SECONDS") or "3600") * 1000)
+_PRODUCT_SEARCH_CACHE: dict[tuple[str, str], tuple[int, list[dict[str, Any]]]] = {}
+_PRODUCT_SEARCH_LOCK = asyncio.Lock()
 
 
 def _now_ms() -> int:
@@ -191,11 +198,43 @@ def _sort_by_price(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 async def _find_products(query: str, *, limit: int, timeout_s: float) -> list[dict[str, Any]]:
+    return await _find_products_with_category(query, category=None, limit=limit, timeout_s=timeout_s)
+
+
+async def _find_products_with_category(
+    query: str,
+    *,
+    category: Optional[str],
+    limit: int,
+    timeout_s: float,
+) -> list[dict[str, Any]]:
+    q = query.strip()
+    if not q:
+        return []
+
+    cat_hint = (category or "").strip().lower()
+    cache_key = (cat_hint, q.lower())
+    now_ms = _now_ms()
+
+    async with _PRODUCT_SEARCH_LOCK:
+        cached = _PRODUCT_SEARCH_CACHE.get(cache_key)
+        if cached and now_ms - cached[0] <= _PRODUCT_SEARCH_TTL_MS:
+            return cached[1][:limit]
+
     try:
+        search_payload: dict[str, Any] = {
+            "query": q,
+            "page": 1,
+            "limit": max(1, min(limit, 50)),
+            "in_stock_only": False,
+        }
+        if cat_hint:
+            search_payload["category"] = cat_hint
+
         result = await _agent_invoke(
             "find_products_multi",
             {
-                "search": {"query": query, "page": 1, "limit": max(1, min(limit, 50)), "in_stock_only": False},
+                "search": search_payload,
                 "metadata": {"source": "pivota-glow-agent"},
             },
             timeout_s=timeout_s,
@@ -208,7 +247,7 @@ async def _find_products(query: str, *, limit: int, timeout_s: float) -> list[di
     if not isinstance(products, list) or not products:
         return []
 
-    category_guess = _guess_category_from_query(query)
+    category_guess = cat_hint or _guess_category_from_query(q)
     scored: list[tuple[int, dict[str, Any]]] = []
     for p in products:
         if not isinstance(p, dict):
@@ -218,7 +257,12 @@ async def _find_products(query: str, *, limit: int, timeout_s: float) -> list[di
     # Prefer category-looking hits; if none, return raw list to allow price-based picking.
     scored.sort(key=lambda x: x[0], reverse=True)
     positive = [p for s, p in scored if s > 0]
-    return positive if positive else [p for _, p in scored]
+    selected = positive if positive else [p for _, p in scored]
+
+    async with _PRODUCT_SEARCH_LOCK:
+        _PRODUCT_SEARCH_CACHE[cache_key] = (now_ms, selected)
+
+    return selected[:limit]
 
 
 async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> Optional[dict[str, Any]]:
@@ -231,6 +275,54 @@ async def _find_one_product(query: str, *, limit: int = 5, timeout_s: float) -> 
         return None
     first = products[0]
     return first if isinstance(first, dict) else None
+
+
+def _normalize_match_text(text: str) -> str:
+    lowered = text.lower()
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _best_product_match(
+    desired: str,
+    *,
+    category: str,
+    candidates: list[dict[str, Any]],
+    brand_hint: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    desired_norm = _normalize_match_text(desired)
+    if not desired_norm:
+        return None
+
+    brand_norm = _normalize_match_text(brand_hint or "")
+    best: tuple[float, dict[str, Any]] | None = None
+
+    for cand in candidates:
+        title = str(cand.get("title") or cand.get("name") or "")
+        if not title.strip():
+            continue
+
+        title_norm = _normalize_match_text(title)
+        if not title_norm:
+            continue
+
+        ratio = difflib.SequenceMatcher(a=desired_norm, b=title_norm).ratio()
+        cat_score = float(_score_product_for_category(category, cand))
+        brand_bonus = 0.15 if brand_norm and brand_norm in title_norm else 0.0
+
+        score = ratio + (cat_score * 0.06) + brand_bonus
+        if best is None or score > best[0]:
+            best = (score, cand)
+
+    if not best:
+        return None
+
+    score, chosen = best
+    # Require a minimum similarity so we don't show clearly unrelated products.
+    if score < 0.35:
+        return None
+    return chosen
 
 
 def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -980,6 +1072,96 @@ async def routine_selection(
         },
     )
     return {"session": patch}
+
+
+@router.post("/offers/resolve")
+async def offers_resolve(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    """
+    Best-effort resolve outbound purchase links (and price/image) for a list of
+    affiliate items, using the Pivota Agent shopping gateway.
+
+    This is intentionally called by the frontend only when the user taps
+    "checkout/open links", to keep routine generation fast.
+    """
+
+    _ = _require_brief_id(x_brief_id)
+
+    raw_items = body.get("items") or body.get("affiliateItems") or body.get("affiliate_items") or []
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=400, detail="`items` must be a list")
+
+    sem = asyncio.Semaphore(4)
+
+    async def _resolve_one(item: Any) -> Optional[dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        product = item.get("product") if isinstance(item.get("product"), dict) else None
+        offer = item.get("offer") if isinstance(item.get("offer"), dict) else None
+        if not product or not offer:
+            return None
+
+        brand = str(product.get("brand") or "").strip()
+        name = str(product.get("name") or "").strip()
+        desired = f"{brand} {name}".strip() or name
+        if not desired:
+            return {"product": product, "offer": offer}
+
+        category = str(product.get("category") or _guess_category_from_query(desired)).strip().lower() or "treatment"
+
+        async with sem:
+            candidates = await _find_products_with_category(
+                desired,
+                category=category,
+                limit=24,
+                timeout_s=DEFAULT_TIMEOUT_S,
+            )
+
+        best = _best_product_match(desired, category=category, candidates=candidates, brand_hint=brand)
+        if not best:
+            return {"product": product, "offer": offer}
+
+        # Patch offer + image URL without changing the product identity (sku_id).
+        patched_product = dict(product)
+        patched_offer = dict(offer)
+
+        if isinstance(best.get("image_url"), str) and best["image_url"].strip():
+            patched_product["image_url"] = best["image_url"].strip()
+        else:
+            imgs = best.get("image_urls")
+            if isinstance(imgs, list) and imgs and isinstance(imgs[0], str):
+                patched_product["image_url"] = imgs[0]
+
+        affiliate_url = best.get("external_redirect_url") or best.get("external_url") or patched_offer.get("affiliate_url")
+        if affiliate_url:
+            patched_offer["purchase_route"] = "affiliate_outbound"
+            patched_offer["affiliate_url"] = str(affiliate_url)
+
+        # Best-effort numeric price/currency/seller.
+        try:
+            patched_offer["price"] = round(float(best.get("price") or patched_offer.get("price") or 0), 2)
+        except Exception:
+            pass
+
+        currency = best.get("currency") or patched_offer.get("currency")
+        if currency:
+            patched_offer["currency"] = str(currency)
+
+        seller = best.get("merchant_name") or best.get("merchant_id") or patched_offer.get("seller")
+        if seller:
+            patched_offer["seller"] = str(seller)
+
+        return {"product": patched_product, "offer": patched_offer}
+
+    resolved = await asyncio.gather(*(_resolve_one(i) for i in raw_items))
+    items = [r for r in resolved if r is not None]
+
+    # trace_id not used yet; reserved for future audit logs.
+    _ = x_trace_id
+    return {"items": items}
 
 
 @router.post("/checkout")

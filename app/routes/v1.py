@@ -382,6 +382,7 @@ def _aurora_profile_line(
     skin_type = None
     concerns: list[str] = []
     current_routine = None
+    barrier_status = None
 
     if isinstance(diagnosis, dict):
         skin_type = diagnosis.get("skinType") or diagnosis.get("skin_type")
@@ -389,15 +390,17 @@ def _aurora_profile_line(
         if isinstance(concerns_raw, list):
             concerns = [str(c) for c in concerns_raw if c]
         current_routine = diagnosis.get("currentRoutine") or diagnosis.get("current_routine")
+        barrier_status = diagnosis.get("barrierStatus") or diagnosis.get("barrier_status") or diagnosis.get("barrier")
 
     concerns_str = ", ".join(concerns) if concerns else "none"
     skin_str = str(skin_type or "unknown")
     routine_str = str(current_routine or "basic")
+    barrier_str = str(barrier_status or "unknown")
 
     return (
         # NOTE: Avoid the substring "routine" in this line because Aurora's /api/chat
         # intent heuristics treat any mention of "routine" as a routine request.
-        f"skin_type={skin_str}; concerns={concerns_str}; region={market}; budget={budget}; current_regimen={routine_str}."
+        f"skin_type={skin_str}; barrier_status={barrier_str}; concerns={concerns_str}; region={market}; budget={budget}; current_regimen={routine_str}."
     )
 
 def _aurora_profile_sentence(
@@ -408,12 +411,14 @@ def _aurora_profile_sentence(
 ) -> str:
     skin_type = None
     concerns: list[str] = []
+    barrier_status = None
 
     if isinstance(diagnosis, dict):
         skin_type = diagnosis.get("skinType") or diagnosis.get("skin_type")
         concerns_raw = diagnosis.get("concerns")
         if isinstance(concerns_raw, list):
             concerns = [str(c) for c in concerns_raw if c]
+        barrier_status = diagnosis.get("barrierStatus") or diagnosis.get("barrier_status") or diagnosis.get("barrier")
 
     # Map front-end concern IDs to keywords Aurora's routine planner reliably detects.
     # (Aurora's current clarify logic is keyword-based; include bilingual hints for robustness.)
@@ -445,7 +450,17 @@ def _aurora_profile_sentence(
 
     concerns_str = ", ".join(deduped) if deduped else "none"
     skin_str = str(skin_type or "unknown")
-    return f"User profile: skin type {skin_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
+    barrier_norm = str(barrier_status or "").strip().lower()
+    if barrier_norm in {"healthy", "stable", "ok", "good"}:
+        barrier_str = "Stable barrier (no stinging/redness) / 屏障稳定"
+    elif barrier_norm in {"impaired", "sensitive", "reactive"}:
+        barrier_str = "Impaired barrier (stinging/redness) / 刺痛泛红，屏障受损"
+    elif barrier_norm in {"unknown", "unsure", "not sure", "n/a"}:
+        barrier_str = "Barrier status unknown (not sure) / 不确定屏障状态"
+    else:
+        barrier_str = str(barrier_status or "unknown")
+
+    return f"User profile: skin type {skin_str}; barrier status: {barrier_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
 
 def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"]) -> Any:
     if not isinstance(clarification, dict):
@@ -820,6 +835,7 @@ async def diagnosis(
         "skinType": body.get("skinType") or body.get("skin_type"),
         "concerns": body.get("concerns") or [],
         "currentRoutine": body.get("currentRoutine") or body.get("current_routine") or "basic",
+        "barrierStatus": body.get("barrierStatus") or body.get("barrier_status") or body.get("barrier") or "unknown",
     }
 
     patch: dict[str, Any] = {
@@ -1108,10 +1124,7 @@ async def routine_reorder(
             return None
 
     if not USE_PIVOTA_AGENT_SEARCH:
-        premium_routine, dupe_routine = await asyncio.gather(
-            _aurora_routine_for_budget("¥1000+"),
-            _aurora_routine_for_budget("¥200"),
-        )
+        premium_routine, dupe_routine = await asyncio.gather(_aurora_routine_for_budget("¥1000+"), _aurora_routine_for_budget("¥200"))
 
         premium_am = premium_routine.get("am") if isinstance(premium_routine, dict) else None
         premium_pm = premium_routine.get("pm") if isinstance(premium_routine, dict) else None
@@ -1123,119 +1136,224 @@ async def routine_reorder(
         dupe_steps_am = dupe_am if isinstance(dupe_am, list) else []
         dupe_steps_pm = dupe_pm if isinstance(dupe_pm, list) else []
 
-        categories_am = [c for c in (_step_category(s) for s in premium_steps_am) if c] or categories_am
-        categories_pm = [c for c in (_step_category(s) for s in premium_steps_pm) if c] or categories_pm
-        all_categories = sorted(set(categories_am + categories_pm))
+        if not (premium_steps_am or premium_steps_pm or dupe_steps_am or dupe_steps_pm):
+            logger.warning("Aurora returned empty routine; falling back to product search. brief_id=%s", brief_id)
+        else:
+            categories_am = [c for c in (_step_category(s) for s in premium_steps_am) if c] or categories_am
+            categories_pm = [c for c in (_step_category(s) for s in premium_steps_pm) if c] or categories_pm
+            all_categories = sorted(set(categories_am + categories_pm))
 
-        def _find_step(steps: list[dict[str, Any]], category: str) -> Optional[dict[str, Any]]:
-            for step in steps:
-                if _step_category(step) == category:
-                    return step
-            return None
+            def _find_step(steps: list[dict[str, Any]], category: str) -> Optional[dict[str, Any]]:
+                for step in steps:
+                    if _step_category(step) == category:
+                        return step
+                return None
 
-        def _build_offer(product_id: str, *, price: float, currency: str, is_dupe: bool, q: str) -> dict[str, Any]:
-            url = f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
-            return {
-                "offer_id": _mk_offer_id("aurora_offer", product_id),
-                "seller": "Aurora",
-                "price": round(price, 2),
-                "currency": currency,
-                "original_price": None,
-                "shipping_days": 5,
-                "returns_policy": "See retailer policy",
-                "reliability_score": 75,
-                "badges": ["best_price"] if is_dupe else ["high_reliability"],
-                "in_stock": True,
-                "purchase_route": "affiliate_outbound",
-                "affiliate_url": url,
-            }
+            def _build_offer(product_id: str, *, price: float, currency: str, is_dupe: bool, q: str) -> dict[str, Any]:
+                url = f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}"
+                return {
+                    "offer_id": _mk_offer_id("aurora_offer", product_id),
+                    "seller": "Aurora",
+                    "price": round(price, 2),
+                    "currency": currency,
+                    "original_price": None,
+                    "shipping_days": 5,
+                    "returns_policy": "See retailer policy",
+                    "reliability_score": 75,
+                    "badges": ["best_price"] if is_dupe else ["high_reliability"],
+                    "in_stock": True,
+                    "purchase_route": "affiliate_outbound",
+                    "affiliate_url": url,
+                }
 
-        def _aurora_product(
-            category: str,
-            step: Optional[dict[str, Any]],
-            *,
-            fallback_price: float,
-            variant: Literal["premium", "dupe"],
-        ) -> tuple[dict[str, Any], dict[str, Any]]:
-            sku = step.get("sku") if isinstance(step, dict) and isinstance(step.get("sku"), dict) else {}
-            base_id = str(sku.get("sku_id") or sku.get("id") or f"aurora_{uuid.uuid4().hex}")
-            # Ensure premium/dupe have distinct IDs even if Aurora returns the same SKU for both.
-            product_id = f"{base_id}_{variant}"
-            name = str(sku.get("name") or f"{category.title()} Pick")
-            brand = str(sku.get("brand") or "Aurora")
-            currency = str(sku.get("currency") or "USD")
-            try:
-                price_f = float(sku.get("price") or 0)
-            except Exception:
-                price_f = 0.0
-            if price_f <= 0:
-                price_f = fallback_price
+            def _normalize_score01(value: Any) -> Optional[float]:
+                try:
+                    num = float(value)
+                except Exception:
+                    return None
+                if not (num == num):  # NaN guard
+                    return None
+                if num > 1:
+                    num = num / 100.0
+                if num < 0:
+                    num = 0.0
+                if num > 1:
+                    num = 1.0
+                return num
 
-            notes = step.get("notes") if isinstance(step, dict) else None
-            note_text = " ".join(str(n) for n in notes) if isinstance(notes, list) else ""
+            def _compute_mechanism_similarity(premium: dict[str, Any], dupe: dict[str, Any]) -> Optional[int]:
+                a = premium.get("mechanism")
+                b = dupe.get("mechanism")
+                if not isinstance(a, dict) or not isinstance(b, dict):
+                    return None
+                keys = [k for k in a.keys() if k in b]
+                if not keys:
+                    return None
+                diffs: list[float] = []
+                for k in keys:
+                    av = _normalize_score01(a.get(k))
+                    bv = _normalize_score01(b.get(k))
+                    if av is None or bv is None:
+                        continue
+                    diffs.append(abs(av - bv))
+                if not diffs:
+                    return None
+                avg = sum(diffs) / len(diffs)
+                return max(0, min(100, int(round((1 - avg) * 100))))
 
-            product = {
-                "sku_id": product_id,
-                "name": name,
-                "brand": brand,
-                "category": category,
-                "description": note_text[:2000],
-                "image_url": "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
-                "size": "1 unit",
-            }
-            offer = _build_offer(
-                product_id,
-                price=price_f,
-                currency=currency,
-                is_dupe=(variant == "dupe"),
-                q=f"{brand} {name}",
-            )
-            return product, offer
+            def _tradeoff_note(premium: dict[str, Any], dupe: dict[str, Any]) -> Optional[str]:
+                notes: list[str] = []
+                exp_d = dupe.get("experience") if isinstance(dupe.get("experience"), dict) else {}
+                texture_d = str(exp_d.get("texture") or "").lower()
+                if texture_d in {"sticky", "thick"}:
+                    notes.append("Dupe texture may feel heavier/stickier.")
+                pilling = _normalize_score01(exp_d.get("pilling_risk"))
+                if pilling is not None and pilling > 0.6:
+                    notes.append("Higher pilling risk under layering.")
 
-        pairs_by_cat: dict[str, dict[str, Any]] = {}
-        for cat in all_categories:
-            premium_step = _find_step(premium_steps_am + premium_steps_pm, cat) if premium_steps_am or premium_steps_pm else None
-            dupe_step = _find_step(dupe_steps_am + dupe_steps_pm, cat) if dupe_steps_am or dupe_steps_pm else None
+                ss_p = premium.get("social_stats") if isinstance(premium.get("social_stats"), dict) else {}
+                ss_d = dupe.get("social_stats") if isinstance(dupe.get("social_stats"), dict) else {}
+                burn_p = _normalize_score01(ss_p.get("burn_rate"))
+                burn_d = _normalize_score01(ss_d.get("burn_rate"))
+                if burn_p is not None and burn_d is not None and burn_d - burn_p >= 0.05:
+                    notes.append("Slightly higher irritation mentions on social.")
 
-            premium_product, premium_offer = _aurora_product(cat, premium_step, fallback_price=55, variant="premium")
-            dupe_product, dupe_offer = _aurora_product(cat, dupe_step, fallback_price=18, variant="dupe")
+                return notes[0] if notes else None
 
-            # Mark dupe offer.
-            dupe_offer = {**dupe_offer, "badges": ["best_price"], "reliability_score": 70}
+            def _extract_kb_actives(step: Optional[dict[str, Any]]) -> list[str]:
+                if not isinstance(step, dict):
+                    return []
+                pack = step.get("evidence_pack")
+                if isinstance(pack, dict):
+                    actives = pack.get("keyActives") or pack.get("key_actives") or pack.get("key_actives_summary")
+                    if isinstance(actives, list):
+                        return [str(a) for a in actives if a]
+                sku = step.get("sku") if isinstance(step.get("sku"), dict) else {}
+                actives = sku.get("actives")
+                if isinstance(actives, list):
+                    return [str(a) for a in actives if a]
+                return []
 
-            pairs_by_cat[cat] = {
-                "category": cat,
-                "premium": {"product": premium_product, "offers": [premium_offer]},
-                "dupe": {"product": dupe_product, "offers": [dupe_offer]},
-            }
+            def _aurora_product(
+                category: str,
+                step: Optional[dict[str, Any]],
+                *,
+                fallback_price: float,
+                variant: Literal["premium", "dupe"],
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                sku = step.get("sku") if isinstance(step, dict) and isinstance(step.get("sku"), dict) else {}
+                source_sku_id = str(sku.get("sku_id") or sku.get("id") or "")
+                base_id = source_sku_id or f"aurora_{uuid.uuid4().hex}"
+                # Ensure premium/dupe have distinct IDs even if Aurora returns the same SKU for both.
+                product_id = f"{base_id}_{variant}"
+                name = str(sku.get("name") or f"{category.title()} Pick")
+                brand = str(sku.get("brand") or "Aurora")
+                currency = str(sku.get("currency") or "USD")
+                try:
+                    price_f = float(sku.get("price") or 0)
+                except Exception:
+                    price_f = 0.0
+                if price_f <= 0:
+                    price_f = fallback_price
 
-        am_pairs = [pairs_by_cat[c] for c in categories_am if c in pairs_by_cat]
-        pm_pairs = [pairs_by_cat[c] for c in categories_pm if c in pairs_by_cat]
+                notes = step.get("notes") if isinstance(step, dict) else None
+                note_text = " ".join(str(n) for n in notes) if isinstance(notes, list) else ""
 
-        selected_offers: dict[str, str] = {}
-        for p in pairs_by_cat.values():
-            selected_offers[p["premium"]["product"]["sku_id"]] = p["premium"]["offers"][0]["offer_id"]
-            selected_offers[p["dupe"]["product"]["sku_id"]] = p["dupe"]["offers"][0]["offer_id"]
+                product: dict[str, Any] = {
+                    "sku_id": product_id,
+                    "source_sku_id": source_sku_id or None,
+                    "name": name,
+                    "brand": brand,
+                    "category": category,
+                    "description": note_text[:2000],
+                    "image_url": sku.get("image_url")
+                    if isinstance(sku.get("image_url"), str) and sku.get("image_url")
+                    else "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
+                    "size": str(sku.get("size") or "1 unit"),
+                }
 
-        patch = {
-            "productPairs": {"am": am_pairs, "pm": pm_pairs},
-            "selected_offers": selected_offers,
-            "routine_conflicts": [],
-            "next_state": "S7_PRODUCT_RECO",
-        }
-        await SESSION_STORE.upsert(
-            brief_id,
-            {
-                "trace_id": x_trace_id,
-                "state": patch["next_state"],
-                "productPairs": patch["productPairs"],
-                "selected_offers": patch["selected_offers"],
-                "preference": preference,
-                "market": market,
-                "budget_tier": budget_tier,
-            },
-        )
-        return {"session": patch, "next_state": patch["next_state"], "productPairs": patch["productPairs"]}
+                # Pass-through scientific + social signals when available.
+                if isinstance(sku.get("mechanism"), dict):
+                    product["mechanism"] = sku.get("mechanism")
+                if isinstance(sku.get("experience"), dict):
+                    product["experience"] = sku.get("experience")
+                if isinstance(sku.get("social_stats"), dict):
+                    product["social_stats"] = sku.get("social_stats")
+                if isinstance(sku.get("risk_flags"), list):
+                    product["risk_flags"] = [str(r) for r in sku.get("risk_flags") if r]
+
+                if isinstance(step, dict) and isinstance(step.get("evidence_pack"), dict):
+                    product["evidence_pack"] = step.get("evidence_pack")
+                if isinstance(step, dict) and isinstance(step.get("ingredients"), dict):
+                    product["ingredients"] = step.get("ingredients")
+
+                actives = _extract_kb_actives(step)
+                if actives:
+                    product["key_actives"] = actives
+
+                offer = _build_offer(
+                    product_id,
+                    price=price_f,
+                    currency=currency,
+                    is_dupe=(variant == "dupe"),
+                    q=f"{brand} {name}",
+                )
+                return product, offer
+
+            pairs_by_cat: dict[str, dict[str, Any]] = {}
+            for cat in all_categories:
+                premium_step = _find_step(premium_steps_am + premium_steps_pm, cat) if premium_steps_am or premium_steps_pm else None
+                dupe_step = _find_step(dupe_steps_am + dupe_steps_pm, cat) if dupe_steps_am or dupe_steps_pm else None
+
+                premium_product, premium_offer = _aurora_product(cat, premium_step, fallback_price=55, variant="premium")
+                dupe_product, dupe_offer = _aurora_product(cat, dupe_step, fallback_price=18, variant="dupe")
+
+                similarity = _compute_mechanism_similarity(premium_product, dupe_product)
+                tradeoff_note = _tradeoff_note(premium_product, dupe_product)
+
+                # Mark dupe offer.
+                dupe_offer = {**dupe_offer, "badges": ["best_price"], "reliability_score": 70}
+
+                pair: dict[str, Any] = {
+                    "category": cat,
+                    "premium": {"product": premium_product, "offers": [premium_offer]},
+                    "dupe": {"product": dupe_product, "offers": [dupe_offer]},
+                }
+                if similarity is not None:
+                    pair["similarity"] = similarity
+                if tradeoff_note:
+                    pair["tradeoff_note"] = tradeoff_note
+
+                pairs_by_cat[cat] = pair
+
+            if pairs_by_cat:
+                am_pairs = [pairs_by_cat[c] for c in categories_am if c in pairs_by_cat]
+                pm_pairs = [pairs_by_cat[c] for c in categories_pm if c in pairs_by_cat]
+
+                selected_offers: dict[str, str] = {}
+                for p in pairs_by_cat.values():
+                    selected_offers[p["premium"]["product"]["sku_id"]] = p["premium"]["offers"][0]["offer_id"]
+                    selected_offers[p["dupe"]["product"]["sku_id"]] = p["dupe"]["offers"][0]["offer_id"]
+
+                patch = {
+                    "productPairs": {"am": am_pairs, "pm": pm_pairs},
+                    "selected_offers": selected_offers,
+                    "routine_conflicts": [],
+                    "next_state": "S7_PRODUCT_RECO",
+                }
+                await SESSION_STORE.upsert(
+                    brief_id,
+                    {
+                        "trace_id": x_trace_id,
+                        "state": patch["next_state"],
+                        "productPairs": patch["productPairs"],
+                        "selected_offers": patch["selected_offers"],
+                        "preference": preference,
+                        "market": market,
+                        "budget_tier": budget_tier,
+                    },
+                )
+                return {"session": patch, "next_state": patch["next_state"], "productPairs": patch["productPairs"]}
 
     # Ask Aurora for a routine blueprint; use its products as seed queries.
     try:

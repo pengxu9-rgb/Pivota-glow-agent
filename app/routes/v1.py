@@ -12,7 +12,7 @@ import urllib.parse
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 
 from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
@@ -179,6 +179,7 @@ async def _upload_photo_via_pivota(
     content_type: str,
     file_name: Optional[str],
     user_id: str,
+    consent: bool,
 ) -> dict[str, Any]:
     presign = await _photos_api_json(
         "POST",
@@ -187,7 +188,7 @@ async def _upload_photo_via_pivota(
             "content_type": content_type,
             "file_name": file_name,
             "byte_size": len(blob),
-            "consent": True,
+            "consent": consent,
             "user_id": user_id,
         },
         timeout_s=DEFAULT_TIMEOUT_S,
@@ -228,6 +229,17 @@ async def _upload_photo_via_pivota(
         if qc_status:
             break
         await asyncio.sleep(0.4)
+
+    if not qc_status:
+        qc_status = "pending"
+    if not qc_advice and qc_status == "pending":
+        tips = presign.get("tips") if isinstance(presign.get("tips"), dict) else {}
+        qc_advice = {
+            "summary": "Photo is processing.",
+            "suggestions": ["Wait a moment and retry.", "If it keeps failing, try re-uploading in better light."],
+            "tips": tips,
+            "retryable": True,
+        }
 
     return {"upload_id": upload_id, "qc_status": qc_status, "qc_advice": qc_advice}
 
@@ -617,8 +629,20 @@ def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict
     if not (features or strategy.strip()):
         return None
 
+    trimmed_features = features[:6]
+
+    # Even when Aurora replies, it may return only 2–3 features.
+    # Ensure the UI has enough substance without introducing fake precision.
+    if 0 < len(trimmed_features) < 4:
+        trimmed_features.append(
+            {
+                "observation": "Key unknowns (current products + irritation history) can change the plan — share your cleanser/actives/moisturizer/SPF for a safer, tighter recommendation.",
+                "confidence": "not_sure",
+            }
+        )
+
     return {
-        "features": features[:6],
+        "features": trimmed_features,
         "strategy": strategy.strip()[:900],
         "needs_risk_check": needs_risk_check,
     }
@@ -1238,6 +1262,7 @@ async def diagnosis(
 async def photos_upload(
     daylight: Optional[UploadFile] = File(default=None),
     indoor_white: Optional[UploadFile] = File(default=None),
+    consent: Optional[bool] = Form(default=None),
     trace_id: Optional[str] = None,
     x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
@@ -1245,6 +1270,10 @@ async def photos_upload(
     brief_id = _require_brief_id(x_brief_id)
     stored = await SESSION_STORE.get(brief_id)
     existing_photos = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
+
+    has_upload = daylight is not None or indoor_white is not None
+    if has_upload and consent is not True:
+        raise HTTPException(status_code=400, detail="Missing consent for photo upload")
 
     def _get_retry_count(slot: str) -> int:
         raw = existing_photos.get(slot) if isinstance(existing_photos, dict) else None
@@ -1260,6 +1289,13 @@ async def photos_upload(
     merged_photos: dict[str, Any] = dict(existing_photos) if isinstance(existing_photos, dict) else {}
 
     async def _process(slot: str, upload: UploadFile) -> None:
+        old = existing_photos.get(slot) if isinstance(existing_photos, dict) else None
+        old_upload_id: Optional[str] = None
+        if isinstance(old, dict):
+            raw_old_upload_id = old.get("upload_id")
+            if isinstance(raw_old_upload_id, str) and raw_old_upload_id.strip():
+                old_upload_id = raw_old_upload_id.strip()
+
         blob = await upload.read()
         content_type = (upload.content_type or "image/jpeg").strip() or "image/jpeg"
         result = await _upload_photo_via_pivota(
@@ -1267,13 +1303,20 @@ async def photos_upload(
             content_type=content_type,
             file_name=upload.filename,
             user_id=brief_id,
+            consent=bool(consent),
         )
+        new_upload_id = result.get("upload_id")
+        if old_upload_id and isinstance(new_upload_id, str) and new_upload_id and old_upload_id != new_upload_id:
+            try:
+                await _photos_api_json("DELETE", "/photos", params={"upload_id": old_upload_id}, timeout_s=DEFAULT_TIMEOUT_S)
+            except Exception as exc:
+                logger.info("Photo delete failed (ignored). upload_id=%s err=%s", old_upload_id, exc)
         retry_count = _get_retry_count(slot)
         if slot in merged_photos:
             retry_count += 1
         slot_patch = {
             "upload_id": result.get("upload_id"),
-            "qc_status": result.get("qc_status") or "blurry",
+            "qc_status": result.get("qc_status") or "pending",
             "retry_count": max(0, retry_count),
         }
         advice = result.get("qc_advice")

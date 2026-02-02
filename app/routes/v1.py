@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import json
 import logging
 import os
 import re
@@ -424,30 +425,94 @@ def _best_product_match(
 
 
 def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, Any]:
-    concerns = diagnosis.get("concerns") if isinstance(diagnosis, dict) else []
-    concerns = concerns if isinstance(concerns, list) else []
-    cset = {str(c) for c in concerns}
+    diag = diagnosis if isinstance(diagnosis, dict) else {}
 
-    needs_risk = any(c in cset for c in {"acne", "dark_spots", "wrinkles"})
+    skin_type_raw = diag.get("skinType") or diag.get("skin_type")
+    skin_type = str(skin_type_raw).strip().lower() if skin_type_raw else ""
+
+    barrier_raw = diag.get("barrierStatus") or diag.get("barrier_status") or diag.get("barrier")
+    barrier = str(barrier_raw).strip().lower() if barrier_raw is not None else "unknown"
+
+    regimen_raw = diag.get("currentRoutine") or diag.get("current_routine") or diag.get("current_regimen")
+    regimen = str(regimen_raw).strip().lower() if regimen_raw else "basic"
+
+    concerns_raw = diag.get("concerns") if isinstance(diag.get("concerns"), list) else []
+    concerns = [str(c).strip().lower() for c in concerns_raw if c]
+    cset = set(concerns)
+
+    needs_risk = any(c in cset for c in {"acne", "dark_spots", "wrinkles", "pores"})
     features: list[dict[str, Any]] = []
 
-    if "acne" in cset:
-        features.append({"observation": "Clogging risk around T-zone", "confidence": "pretty_sure"})
-    if "dark_spots" in cset:
-        features.append({"observation": "Uneven tone / hyperpigmentation signals", "confidence": "somewhat_sure"})
-    if "redness" in cset or "sensitive" in cset:
-        features.append({"observation": "Barrier looks reactive (possible redness/sensitivity)", "confidence": "somewhat_sure"})
-    if not features:
-        features = [
-            {"observation": "Skin looks generally balanced", "confidence": "somewhat_sure"},
-            {"observation": "Hydration could be improved", "confidence": "not_sure"},
-        ]
+    # 1) Barrier framing (safe default).
+    if barrier in {"impaired", "reactive", "stressed", "sensitive"}:
+        features.append(
+            {
+                "observation": "Barrier likely stressed → prioritize repair and avoid stacking strong actives until stinging/redness calms.",
+                "confidence": "pretty_sure",
+            }
+        )
+    elif barrier in {"healthy", "stable", "ok", "good"}:
+        features.append(
+            {
+                "observation": "Barrier seems stable → you can introduce actives gradually (one at a time, low frequency).",
+                "confidence": "somewhat_sure",
+            }
+        )
+    else:
+        features.append(
+            {
+                "observation": "Barrier status is unclear → start gentle and treat skin as sensitive until proven otherwise.",
+                "confidence": "somewhat_sure",
+            }
+        )
 
-    strategy = "Build a simple routine: cleanse → treat (if needed) → moisturize → SPF."
-    if needs_risk:
-        strategy = "Prioritize gentle actives with barrier-first support to hit your goals without irritation."
+    # 2) Skin-type context (self-reported).
+    skin_type_map: dict[str, str] = {
+        "oily": "Self-reported oily skin → higher sebum/clogging tendency; avoid over-stripping (oily skin can still be dehydrated).",
+        "dry": "Self-reported dry skin → prioritize barrier support and longer-lasting hydration.",
+        "combination": "Self-reported combination skin → balance: lighter layers on T‑zone, richer support on drier areas.",
+        "normal": "Self-reported normal skin → keep it minimal and consistent; avoid unnecessary actives.",
+        "sensitive": "Self-reported sensitive skin → minimize fragrance/alcohol and introduce actives slowly.",
+    }
+    if skin_type in skin_type_map:
+        features.append({"observation": skin_type_map[skin_type], "confidence": "pretty_sure"})
 
-    return {"features": features, "strategy": strategy, "needs_risk_check": needs_risk}
+    # 3) Goals / concerns (self-reported).
+    concern_map: dict[str, str] = {
+        "acne": "Acne/clogged pores goal → change one thing at a time; if using actives, start 2–3 nights/week and titrate only if irritation stays low.",
+        "pores": "Pores/texture goal → gentle exfoliation can help, but avoid combining multiple strong actives in the same night.",
+        "dark_spots": "Dark spots goal → daily SPF is the biggest lever; add ONE brightening active only after tolerance is confirmed.",
+        "wrinkles": "Fine lines goal → sunscreen + hydration first; consider a retinoid only after the barrier feels stable (start 2 nights/week).",
+        "redness": "Redness/sensitivity goal → reduce triggers and prioritize calm/repair before adding new actives.",
+        "dehydration": "Dehydration goal → focus on hydration + repair and avoid harsh cleansing that can worsen tightness.",
+        "dullness": "Dullness goal → often improves with consistent SPF + hydration; consider gentle exfoliation later if skin tolerates it.",
+    }
+
+    for key in ["acne", "dark_spots", "wrinkles", "pores", "redness", "dehydration", "dullness"]:
+        if key in cset and key in concern_map:
+            features.append({"observation": concern_map[key], "confidence": "pretty_sure"})
+        if len(features) >= 5:
+            break
+
+    # 4) Routine complexity (helps explain “why minimal”).
+    if regimen in {"full", "complex", "many"} and len(features) < 6:
+        features.append(
+            {
+                "observation": "A more complex regimen increases conflict/irritation risk → simplify first, then re‑introduce actives stepwise.",
+                "confidence": "somewhat_sure",
+            }
+        )
+    elif regimen in {"none", "no", "start", "from scratch"} and len(features) < 6:
+        features.append(
+            {
+                "observation": "No current regimen → build a stable baseline first (cleanse + moisturize + SPF) before adding actives.",
+                "confidence": "pretty_sure",
+            }
+        )
+
+    strategy = _strategy_from_profile(diagnosis, None)
+
+    return {"features": features[:6], "strategy": strategy, "needs_risk_check": needs_risk}
 
 
 def _strategy_from_profile(
@@ -455,7 +520,7 @@ def _strategy_from_profile(
     detected: Optional[dict[str, Any]] = None,
 ) -> str:
     concerns_raw = diagnosis.get("concerns") if isinstance(diagnosis, dict) else []
-    concerns = {str(c) for c in concerns_raw} if isinstance(concerns_raw, list) else set()
+    concerns = {str(c).strip().lower() for c in concerns_raw if c} if isinstance(concerns_raw, list) else set()
 
     barrier = None
     if isinstance(diagnosis, dict):
@@ -464,33 +529,45 @@ def _strategy_from_profile(
 
     detected = detected if isinstance(detected, dict) else {}
     oily_acne = bool(detected.get("oily_acne")) or ("acne" in concerns)
-    sensitive = bool(detected.get("sensitive_skin")) or ("redness" in concerns) or barrier == "impaired"
     barrier_impaired = bool(detected.get("barrier_impaired")) or barrier == "impaired"
+    barrier_unknown = barrier in {"unknown", "unsure", "not sure", "n/a", ""}
+    sensitive = bool(detected.get("sensitive_skin")) or ("redness" in concerns) or barrier_impaired or barrier_unknown
     dark_spots = "dark_spots" in concerns
     anti_aging = "wrinkles" in concerns
 
     lines: list[str] = []
 
-    if barrier_impaired or sensitive:
-        lines.append("Barrier-first for 7–10 days: pause strong actives (retinoids, acids, benzoyl peroxide) if you get stinging or peeling.")
-        lines.append("Keep it minimal: AM gentle cleanse (or rinse) → moisturizer → SPF; PM cleanse → moisturizer.")
+    if sensitive:
+        lines.append(
+            "Barrier-first for 7–10 days: avoid stacking strong actives (retinoids, acids, benzoyl peroxide). If you get stinging/peeling, pause actives and focus on repair."
+        )
+        lines.append("Minimal baseline: AM rinse (or gentle cleanse) → moisturizer → SPF; PM gentle cleanse → moisturizer.")
+        lines.append("Re‑introduce only ONE active at a time once skin feels calm for 3+ days (start 2 nights/week).")
 
     if oily_acne:
-        lines.append("For oil + breakouts: introduce ONE acne active at a time (e.g., BHA) 2–3 nights/week, then increase only if your barrier stays calm.")
-        lines.append("Avoid stacking multiple actives in the same night; prioritize consistency + sunscreen.")
+        lines.append(
+            "For oil + breakouts: keep cleansing gentle (avoid over‑stripping) and introduce ONE acne active at a time (e.g., BHA) 2–3 nights/week."
+        )
+        lines.append("Avoid combining multiple strong actives in the same night; prioritize consistency + sunscreen.")
 
     if dark_spots:
-        lines.append("For dark spots: daily SPF is non-negotiable; add one brightening active (e.g., vitamin C or a pigment-safe alternative) once tolerance is confirmed.")
+        lines.append(
+            "For dark spots: daily SPF is non‑negotiable; add one brightening active only after tolerance is confirmed (irritation can worsen pigmentation)."
+        )
 
     if anti_aging:
-        lines.append("For fine lines: focus on sunscreen + hydration first; consider a retinoid only after your barrier feels stable (start 2 nights/week).")
+        lines.append(
+            "For fine lines: sunscreen + hydration first; consider a retinoid only after the barrier feels stable (start 2 nights/week and increase slowly)."
+        )
+        lines.append("Timeline: expect visible texture/line changes in ~8–12 weeks; faster changes are usually irritation, not improvement.")
 
     if not lines:
         lines.append("Keep it simple: AM gentle cleanse → moisturizer → SPF; PM cleanse → moisturizer.")
-        lines.append("If you share your current products, I can flag conflicts and suggest the smallest changes first.")
+
+    lines.append("If you share what you’re using now (cleanser/actives/moisturizer/SPF), I can flag conflicts and suggest the smallest changes first.")
 
     # Keep it short for the UI.
-    return " ".join(lines[:5]).strip()
+    return " ".join(lines[:6]).strip()
 
 
 def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -536,6 +613,62 @@ def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict
         "strategy": strategy.strip()[:900],
         "needs_risk_check": needs_risk_check,
     }
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _analysis_contains_cjk(obj: dict[str, Any]) -> bool:
+    if _contains_cjk(str(obj.get("strategy") or "")):
+        return True
+    feats = obj.get("features")
+    if isinstance(feats, list):
+        for f in feats:
+            if isinstance(f, dict) and _contains_cjk(str(f.get("observation") or "")):
+                return True
+    return False
+
+
+async def _translate_analysis_to_english(
+    *,
+    analysis_obj: dict[str, Any],
+    llm_provider: Optional[str],
+    llm_model: Optional[str],
+) -> dict[str, Any]:
+    """
+    Aurora sometimes replies in Chinese even when asked for English. For analysis JSON,
+    translate values while keeping the same schema.
+    """
+
+    try:
+        source = json.dumps(analysis_obj, ensure_ascii=False)
+    except Exception:
+        return analysis_obj
+
+    try:
+        translation = await aurora_chat(
+            base_url=AURORA_DECISION_BASE_URL,
+            query=(
+                "Translate the following JSON into English.\n"
+                "Rules:\n"
+                "- Return ONLY valid JSON.\n"
+                "- Keep the same keys and structure.\n"
+                "- Keep `confidence` values as one of: pretty_sure | somewhat_sure | not_sure.\n"
+                "- Do NOT add any numeric scores/percentages.\n"
+                "IMPORTANT: Reply ONLY in English. Do not use Chinese.\n\n"
+                f"JSON:\n{source}"
+            ),
+            timeout_s=DEFAULT_TIMEOUT_S,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        )
+        answer = translation.get("answer") if isinstance(translation, dict) else None
+        parsed = extract_json_object(answer or "")
+        normalized = _normalize_analysis_from_llm(parsed)
+        return normalized or analysis_obj
+    except Exception as exc:
+        logger.warning("Analysis translation failed; keeping original. err=%s", exc)
+        return analysis_obj
 
 
 def _budget_tier_to_aurora_budget(budget_tier: Any) -> str:
@@ -718,20 +851,32 @@ def _analysis_from_aurora_context(
     if detected.get("oily_acne") is True:
         features.extend(
             [
-                {"observation": "Higher oil/shine patterns (acne-prone tendency)", "confidence": "pretty_sure"},
-                {"observation": "Pores may clog more easily without gentle balancing", "confidence": "somewhat_sure"},
+                {
+                    "observation": "Oily/acne‑prone tendency detected → higher clogging risk; keep cleansing gentle and avoid over‑stripping.",
+                    "confidence": "somewhat_sure",
+                },
+                {
+                    "observation": "If you’re breakout‑prone, introduce actives stepwise (one at a time) to avoid irritation‑driven flares.",
+                    "confidence": "somewhat_sure",
+                },
             ]
         )
     if detected.get("sensitive_skin") is True:
         features.extend(
             [
-                {"observation": "Skin looks reactive/sensitive (irritation risk)", "confidence": "somewhat_sure"},
+                {
+                    "observation": "Sensitive/reactive tendency detected → minimize irritants (fragrance/alcohol) and patch‑test new actives.",
+                    "confidence": "somewhat_sure",
+                },
             ]
         )
     if detected.get("barrier_impaired") is True:
         features.extend(
             [
-                {"observation": "Barrier may be stressed (prioritize repair + low irritation)", "confidence": "pretty_sure"},
+                {
+                    "observation": "Barrier‑stress signal detected → prioritize repair first; avoid stacking strong actives until irritation settles.",
+                    "confidence": "somewhat_sure",
+                },
             ]
         )
 
@@ -1186,14 +1331,44 @@ async def analysis(
     budget_tier = stored.get("budget_tier") or body.get("budget_tier") or "$$"
     budget = _budget_tier_to_aurora_budget(budget_tier)
 
+    language = body.get("language")
+    lang_code: Literal["EN", "CN"] = "EN"
+    reply_language = "English"
+    if isinstance(language, str) and language.strip().upper() in {"CN", "ZH", "ZH-CN", "ZH_HANS"}:
+        lang_code = "CN"
+        reply_language = "Simplified Chinese"
+
+    reply_instruction = (
+        "IMPORTANT: Reply ONLY in English. Do not use Chinese."
+        if lang_code == "EN"
+        else "请只用简体中文回答，不要使用英文。"
+    )
+
+    photos_raw = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
+    photo_qc_parts: list[str] = []
+    passed_count = 0
+    for slot in ("daylight", "indoor_white"):
+        raw = photos_raw.get(slot)
+        if not isinstance(raw, dict):
+            continue
+        qc = raw.get("qc_status") or raw.get("qcStatus") or raw.get("qc")
+        qc = str(qc).strip().lower() if qc is not None else ""
+        if qc:
+            photo_qc_parts.append(f"{slot}:{qc}")
+        if qc == "passed":
+            passed_count += 1
+    photos_provided = passed_count > 0
+
     aurora_context: Optional[dict[str, Any]] = None
     aurora_answer: Optional[str] = None
     try:
         profile_line = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
+        photo_line = f"photos_provided={'yes' if photos_provided else 'no'}; photo_qc={', '.join(photo_qc_parts) if photo_qc_parts else 'none'}."
         prompt = (
             (f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else "")
             + f"{profile_line}\n"
-            + "Task: Provide a concise skin assessment based on the profile above.\n\n"
+            + f"{photo_line}\n"
+            + "Task: Provide a skin assessment that is honest about uncertainty and feels like a cautious dermatologist.\n\n"
             + "Return ONLY a valid JSON object (no markdown) with this exact shape:\n"
             + '{\n'
             + '  "features": [\n'
@@ -1203,10 +1378,14 @@ async def analysis(
             + '  "needs_risk_check": true | false\n'
             + '}\n\n'
             + "Rules:\n"
-            + "- Observations must be about the user's skin (barrier, acne risk, pigmentation, irritation, etc.).\n"
-            + "- Strategy must be actionable (what to do/avoid + frequency), but DO NOT recommend specific products/brands yet.\n"
-            + "- Keep it short: 3–6 features and a 2–5 sentence strategy.\n"
-            + "Language: English.\n"
+            + "- DO NOT output any numeric scores/percentages (no “match score”).\n"
+            + "- If photos_provided=no: DO NOT make visual claims. Avoid 'looks', 'I see', or 'in the photo'. Base everything on self-report.\n"
+            + "- Observations must be about the user's skin goals/safety (barrier, acne risk, pigmentation, irritation, etc.) and include a short reason.\n"
+            + "- Strategy must be actionable and stepwise: (a) what to do for the next 7 days, (b) how to introduce actives safely if relevant, (c) one clarifying question to improve personalization.\n"
+            + "- DO NOT recommend specific products/brands yet.\n"
+            + "- Keep it concise: 4–6 features; strategy under 900 characters.\n"
+            + f"Language: {reply_language}.\n"
+            + f"{reply_instruction}\n"
         )
 
         aurora_payload = await aurora_chat(
@@ -1228,6 +1407,13 @@ async def analysis(
         analysis_result = normalized
     else:
         analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
+
+    if lang_code == "EN" and _analysis_contains_cjk(analysis_result):
+        analysis_result = await _translate_analysis_to_english(
+            analysis_obj=analysis_result,
+            llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
+            llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
+        )
 
     patch = {"analysis": analysis_result, "next_state": "S5_ANALYSIS_SUMMARY"}
     await SESSION_STORE.upsert(

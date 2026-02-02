@@ -12,7 +12,7 @@ import urllib.parse
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
 
 from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
@@ -1220,6 +1220,81 @@ def _require_brief_id(x_brief_id: Optional[str]) -> str:
     return x_brief_id
 
 
+def _truncate_event_payload(value: Any, limit: int = 2000) -> Any:
+    try:
+        text = str(value)
+    except Exception:
+        return value
+    if len(text) <= limit:
+        return value
+    return text[:limit] + "…"
+
+
+@router.post("/events")
+async def ingest_events(
+    body: Any,
+    request: Request,
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    events: list[dict[str, Any]] = []
+    if isinstance(body, dict) and isinstance(body.get("events"), list):
+        for e in body.get("events") or []:
+            if isinstance(e, dict):
+                events.append(e)
+    elif isinstance(body, list):
+        for e in body:
+            if isinstance(e, dict):
+                events.append(e)
+    elif isinstance(body, dict):
+        events.append(body)
+
+    if not events:
+        raise HTTPException(status_code=400, detail="Missing events")
+
+    # Prevent log/ingest abuse.
+    if len(events) > 200:
+        raise HTTPException(status_code=400, detail="Too many events")
+
+    client_ip = request.headers.get("x-forwarded-for") or request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+    accepted = 0
+    for raw in events:
+        event_name = raw.get("event_name") or raw.get("eventName")
+        brief_id = raw.get("brief_id") or raw.get("briefId")
+        trace_id = raw.get("trace_id") or raw.get("traceId") or x_trace_id
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else raw.get("properties")
+
+        if not isinstance(event_name, str) or not event_name.strip():
+            continue
+
+        row = {
+            "event_name": event_name.strip()[:120],
+            "brief_id": str(brief_id or "")[:120],
+            "trace_id": str(trace_id or "")[:120],
+            "timestamp": raw.get("timestamp"),
+            "data": _truncate_event_payload(data, 4000) if data is not None else None,
+            "source": raw.get("source") or "client",
+            "client_ip": client_ip,
+            "user_agent": user_agent,
+        }
+        logger.info("client_event=%s", row)
+        accepted += 1
+
+        # Store a small tail for debugging (best-effort).
+        if row["brief_id"]:
+            try:
+                stored = await SESSION_STORE.get(row["brief_id"])
+                existing = stored.get("client_events")
+                tail = existing if isinstance(existing, list) else []
+                tail = [*tail, row][-50:]
+                await SESSION_STORE.upsert(row["brief_id"], {"client_events": tail})
+            except Exception:
+                pass
+
+    return {"ok": True, "accepted": accepted}
+
+
 @router.post("/diagnosis")
 async def diagnosis(
     body: dict[str, Any],
@@ -1306,10 +1381,17 @@ async def photos_upload(
             consent=bool(consent),
         )
         new_upload_id = result.get("upload_id")
+        replaced_upload_deleted: Optional[bool] = None
         if old_upload_id and isinstance(new_upload_id, str) and new_upload_id and old_upload_id != new_upload_id:
             try:
                 await _photos_api_json("DELETE", "/photos", params={"upload_id": old_upload_id}, timeout_s=DEFAULT_TIMEOUT_S)
+                replaced_upload_deleted = True
+                logger.info(
+                    "photo_old_upload_deleted=%s",
+                    {"brief_id": brief_id, "slot": slot, "old_upload_id": old_upload_id},
+                )
             except Exception as exc:
+                replaced_upload_deleted = False
                 logger.info("Photo delete failed (ignored). upload_id=%s err=%s", old_upload_id, exc)
         retry_count = _get_retry_count(slot)
         if slot in merged_photos:
@@ -1319,6 +1401,9 @@ async def photos_upload(
             "qc_status": result.get("qc_status") or "pending",
             "retry_count": max(0, retry_count),
         }
+        if old_upload_id and isinstance(new_upload_id, str) and new_upload_id and old_upload_id != new_upload_id:
+            slot_patch["replaced_upload_id"] = old_upload_id
+            slot_patch["replaced_upload_deleted"] = replaced_upload_deleted
         advice = result.get("qc_advice")
         if isinstance(advice, dict):
             slot_patch["qc_advice"] = advice

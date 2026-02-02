@@ -629,6 +629,42 @@ def _analysis_contains_cjk(obj: dict[str, Any]) -> bool:
     return False
 
 
+def _analysis_violates_guardrails(*, analysis_obj: dict[str, Any], photos_provided: bool) -> bool:
+    """
+    Protect against "fake precision" and visual claims when no photos are provided.
+    If violated, we fall back to rule-based analysis.
+    """
+
+    pieces: list[str] = [str(analysis_obj.get("strategy") or "")]
+    feats = analysis_obj.get("features")
+    if isinstance(feats, list):
+        for f in feats:
+            if isinstance(f, dict):
+                pieces.append(str(f.get("observation") or ""))
+    joined = " ".join(pieces).strip()
+    lowered = joined.lower()
+
+    # Avoid fake numeric scoring.
+    if "match score" in lowered or "%" in joined:
+        return True
+
+    # Avoid visual claims when we have no photos.
+    if not photos_provided:
+        visual_markers = [
+            "looks",
+            "i see",
+            "in the photo",
+            "in the photos",
+            "photo shows",
+            "appears to be",
+            "looks like",
+        ]
+        if any(m in lowered for m in visual_markers):
+            return True
+
+    return False
+
+
 async def _translate_analysis_to_english(
     *,
     analysis_obj: dict[str, Any],
@@ -1404,7 +1440,11 @@ async def analysis(
     parsed = extract_json_object(aurora_answer or "")
     normalized = _normalize_analysis_from_llm(parsed)
     if normalized:
-        analysis_result = normalized
+        if _analysis_violates_guardrails(analysis_obj=normalized, photos_provided=photos_provided):
+            logger.warning("LLM analysis violated guardrails; using rule-based fallback.")
+            analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
+        else:
+            analysis_result = normalized
     else:
         analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
 

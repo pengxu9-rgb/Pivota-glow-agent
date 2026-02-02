@@ -12,7 +12,7 @@ import urllib.parse
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Request, UploadFile
 
 from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
@@ -1232,8 +1232,8 @@ def _truncate_event_payload(value: Any, limit: int = 2000) -> Any:
 
 @router.post("/events")
 async def ingest_events(
-    body: Any,
     request: Request,
+    body: Any = Body(...),
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     events: list[dict[str, Any]] = []

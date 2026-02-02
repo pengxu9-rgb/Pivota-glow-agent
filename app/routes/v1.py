@@ -777,6 +777,48 @@ async def _translate_analysis_to_english(
         return analysis_obj
 
 
+async def _translate_analysis_to_chinese(
+    *,
+    analysis_obj: dict[str, Any],
+    llm_provider: Optional[str],
+    llm_model: Optional[str],
+) -> dict[str, Any]:
+    """
+    Aurora sometimes replies in English even when asked for Chinese. For analysis JSON,
+    translate values while keeping the same schema.
+    """
+
+    try:
+        source = json.dumps(analysis_obj, ensure_ascii=False)
+    except Exception:
+        return analysis_obj
+
+    try:
+        translation = await aurora_chat(
+            base_url=AURORA_DECISION_BASE_URL,
+            query=(
+                "Translate the following JSON into Simplified Chinese.\n"
+                "Rules:\n"
+                "- Return ONLY valid JSON.\n"
+                "- Keep the same keys and structure.\n"
+                "- Keep `confidence` values as one of: pretty_sure | somewhat_sure | not_sure.\n"
+                "- Do NOT add any numeric scores/percentages.\n"
+                "IMPORTANT: Reply ONLY in Simplified Chinese. Do not use English.\n\n"
+                f"JSON:\n{source}"
+            ),
+            timeout_s=DEFAULT_TIMEOUT_S,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        )
+        answer = translation.get("answer") if isinstance(translation, dict) else None
+        parsed = extract_json_object(answer or "")
+        normalized = _normalize_analysis_from_llm(parsed)
+        return normalized or analysis_obj
+    except Exception as exc:
+        logger.warning("Analysis translation failed; keeping original. err=%s", exc)
+        return analysis_obj
+
+
 def _budget_tier_to_aurora_budget(budget_tier: Any) -> str:
     mapping = {"$": "¥200", "$$": "¥500", "$$$": "¥1000+"}
     if isinstance(budget_tier, str):
@@ -1624,6 +1666,12 @@ async def analysis(
 
     if lang_code == "EN" and _analysis_contains_cjk(analysis_result):
         analysis_result = await _translate_analysis_to_english(
+            analysis_obj=analysis_result,
+            llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
+            llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
+        )
+    if lang_code == "CN" and not _analysis_contains_cjk(analysis_result):
+        analysis_result = await _translate_analysis_to_chinese(
             analysis_obj=analysis_result,
             llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
             llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,

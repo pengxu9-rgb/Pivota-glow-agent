@@ -12,6 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes.health import router as health_router
 from app.routes.v1 import router as v1_router
 
+DEFAULT_CORS_ORIGINS = [
+    # Production chatbox custom domain (Vercel).
+    "https://aurora.pivota.cc",
+    # Default Vercel domain (allows preview via allow_origin_regex when present).
+    "https://pivota-aurora-chatbox.vercel.app",
+]
+
 
 def _parse_cors_origins(raw: Optional[str]) -> list[str]:
     if not raw:
@@ -65,6 +72,10 @@ def create_app() -> FastAPI:
 
     origins = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
     allow_all = "*" in origins
+    if not allow_all:
+        for origin in DEFAULT_CORS_ORIGINS:
+            if origin not in origins:
+                origins.append(origin)
     allow_origin_regex = None if allow_all else _build_allow_origin_regex(origins)
 
     app.add_middleware(

@@ -13,7 +13,7 @@ from typing import Any, Literal, Optional
 import httpx
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 
-from app.services.aurora import aurora_chat
+from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
 
 
@@ -358,6 +358,51 @@ def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, A
         strategy = "Prioritize gentle actives with barrier-first support to hit your goals without irritation."
 
     return {"features": features, "strategy": strategy, "needs_risk_check": needs_risk}
+
+
+def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+
+    raw_features = obj.get("features")
+    features: list[dict[str, Any]] = []
+    if isinstance(raw_features, list):
+        for item in raw_features:
+            if not isinstance(item, dict):
+                continue
+            observation = item.get("observation") or item.get("finding") or item.get("text")
+            if not isinstance(observation, str) or not observation.strip():
+                continue
+            confidence = item.get("confidence")
+            if not isinstance(confidence, str):
+                confidence = "somewhat_sure"
+            confidence = confidence.strip()
+            if confidence not in {"pretty_sure", "somewhat_sure", "not_sure"}:
+                confidence = "somewhat_sure"
+            features.append({"observation": observation.strip()[:220], "confidence": confidence})
+
+    strategy = obj.get("strategy")
+    if isinstance(strategy, list):
+        strategy = "\n".join(str(x) for x in strategy if x)
+    if not isinstance(strategy, str):
+        strategy = ""
+
+    needs_risk_check = obj.get("needs_risk_check")
+    if needs_risk_check is None:
+        needs_risk_check = obj.get("needsRiskCheck")
+    if isinstance(needs_risk_check, str):
+        needs_risk_check = needs_risk_check.strip().lower() in {"1", "true", "yes", "y"}
+    if not isinstance(needs_risk_check, bool):
+        needs_risk_check = False
+
+    if not (features or strategy.strip()):
+        return None
+
+    return {
+        "features": features[:6],
+        "strategy": strategy.strip()[:900],
+        "needs_risk_check": needs_risk_check,
+    }
 
 
 def _budget_tier_to_aurora_budget(budget_tier: Any) -> str:
@@ -953,21 +998,47 @@ async def analysis(
     budget = _budget_tier_to_aurora_budget(budget_tier)
 
     aurora_context: Optional[dict[str, Any]] = None
+    aurora_answer: Optional[str] = None
     try:
+        profile_line = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
+        prompt = (
+            (f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else "")
+            + f"{profile_line}\n"
+            + "Task: Provide a concise skin assessment based on the profile above.\n\n"
+            + "Return ONLY a valid JSON object (no markdown) with this exact shape:\n"
+            + '{\n'
+            + '  "features": [\n'
+            + '    {"observation": "…", "confidence": "pretty_sure" | "somewhat_sure" | "not_sure"}\n'
+            + '  ],\n'
+            + '  "strategy": "…",\n'
+            + '  "needs_risk_check": true | false\n'
+            + '}\n\n'
+            + "Rules:\n"
+            + "- Observations must be about the user's skin (barrier, acne risk, pigmentation, irritation, etc.).\n"
+            + "- Strategy must be actionable (what to do/avoid + frequency), but DO NOT recommend specific products/brands yet.\n"
+            + "- Keep it short: 3–6 features and a 2–5 sentence strategy.\n"
+            + "Language: English.\n"
+        )
+
         aurora_payload = await aurora_chat(
             base_url=AURORA_DECISION_BASE_URL,
-            query=(
-                f"{_aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
-                "Give a brief diagnosis and a safe, minimal routine strategy. Reply in English."
-            ),
+            query=prompt,
             timeout_s=DEFAULT_TIMEOUT_S,
         )
         aurora_ctx_raw = aurora_payload.get("context") if isinstance(aurora_payload, dict) else None
         aurora_context = aurora_ctx_raw if isinstance(aurora_ctx_raw, dict) else None
+        if isinstance(aurora_payload.get("answer"), str):
+            aurora_answer = aurora_payload.get("answer")
     except Exception as exc:
         logger.warning("Aurora analysis call failed; falling back. err=%s", exc)
 
-    analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
+    analysis_result: dict[str, Any]
+    parsed = extract_json_object(aurora_answer or "")
+    normalized = _normalize_analysis_from_llm(parsed)
+    if normalized:
+        analysis_result = normalized
+    else:
+        analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
 
     patch = {"analysis": analysis_result, "next_state": "S5_ANALYSIS_SUMMARY"}
     await SESSION_STORE.upsert(

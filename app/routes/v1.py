@@ -1622,6 +1622,61 @@ async def photos_upload(
     return {"session": patch, "next_state": patch["next_state"]}
 
 
+@router.get("/photos/qc")
+async def photos_qc(
+    upload_id: str,
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    brief_id = _require_brief_id(x_brief_id)
+    upload_id = (upload_id or "").strip()
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="Missing upload_id")
+
+    result = await _photos_api_json(
+        "GET",
+        "/photos/qc",
+        params={"upload_id": upload_id},
+        timeout_s=DEFAULT_TIMEOUT_S,
+    )
+
+    qc_status = result.get("qc_status") or result.get("qcStatus") or result.get("status")
+    qc_advice = result.get("qc_advice") if isinstance(result.get("qc_advice"), dict) else result.get("qcAdvice")
+
+    try:
+        stored = await SESSION_STORE.get(brief_id)
+        photos = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
+        updated: dict[str, Any] = dict(photos) if isinstance(photos, dict) else {}
+
+        updated_any = False
+        for slot in ("daylight", "indoor_white"):
+            raw = updated.get(slot)
+            if not isinstance(raw, dict):
+                continue
+            slot_upload_id = raw.get("upload_id")
+            if isinstance(slot_upload_id, str) and slot_upload_id.strip() == upload_id:
+                if qc_status:
+                    raw["qc_status"] = qc_status
+                if isinstance(qc_advice, dict):
+                    raw["qc_advice"] = qc_advice
+                updated[slot] = raw
+                updated_any = True
+
+        if updated_any:
+            await SESSION_STORE.upsert(
+                brief_id,
+                {
+                    "trace_id": x_trace_id,
+                    "photos": updated,
+                },
+            )
+    except Exception:
+        # Best-effort session update: ignore.
+        pass
+
+    return {"upload_id": upload_id, "qc_status": qc_status, "qc_advice": qc_advice}
+
+
 @router.post("/photos/sample")
 async def photos_sample(
     body: dict[str, Any],

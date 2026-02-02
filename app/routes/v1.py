@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import difflib
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
 import uuid
@@ -31,6 +33,13 @@ USE_PIVOTA_AGENT_SEARCH = (os.getenv("USE_PIVOTA_AGENT_SEARCH") or "").strip().l
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
 OFFERS_RESOLVE_TIMEOUT_S = float(os.getenv("OFFERS_RESOLVE_TIMEOUT_S") or "55")
+
+# Optional analytics forwarding.
+POSTHOG_API_KEY = (os.getenv("POSTHOG_API_KEY") or "").strip() or None
+POSTHOG_HOST = (os.getenv("POSTHOG_HOST") or os.getenv("POSTHOG_URL") or "").strip().rstrip("/") or None
+POSTHOG_TIMEOUT_S = float(os.getenv("POSTHOG_TIMEOUT_S") or "3")
+EVENTS_JSONL_SINK_DIR = (os.getenv("EVENTS_JSONL_SINK_DIR") or "").strip() or None
+EVENTS_INCLUDE_CLIENT_IP = (os.getenv("EVENTS_INCLUDE_CLIENT_IP") or "").strip().lower() in {"1", "true", "yes", "y"}
 
 # Best-effort cache for product lookups so repeated checkout clicks are fast.
 _PRODUCT_SEARCH_TTL_MS = int(float(os.getenv("PRODUCT_SEARCH_CACHE_TTL_SECONDS") or "3600") * 1000)
@@ -1309,6 +1318,91 @@ def _truncate_event_payload(value: Any, limit: int = 2000) -> Any:
     return text[:limit] + "…"
 
 
+def _format_posthog_timestamp(raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    if isinstance(raw, (int, float)):
+        try:
+            ts = float(raw)
+            if ts > 1e12:  # ms
+                ts /= 1000.0
+            if ts < 1e9:  # too small / invalid
+                return None
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+    return None
+
+
+def _append_events_jsonl_sink(*, dir_path: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    out_dir = Path(dir_path).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    date_key = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    file_path = out_dir / f"client-events-{date_key}.jsonl"
+    with file_path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+async def _forward_events_to_posthog(*, rows: list[dict[str, Any]]) -> None:
+    if not POSTHOG_API_KEY or not POSTHOG_HOST:
+        return
+    if not rows:
+        return
+
+    batch: list[dict[str, Any]] = []
+    for row in rows:
+        distinct_id = row.get("brief_id") or "anonymous"
+        user_agent = row.get("user_agent")
+        properties: dict[str, Any] = {
+            "distinct_id": distinct_id,
+            "brief_id": row.get("brief_id"),
+            "trace_id": row.get("trace_id"),
+            "source": row.get("source"),
+            "data": row.get("data"),
+            "user_agent": user_agent[:400] if isinstance(user_agent, str) else None,
+        }
+        if EVENTS_INCLUDE_CLIENT_IP:
+            properties["client_ip"] = row.get("client_ip")
+
+        item: dict[str, Any] = {
+            "event": row.get("event_name"),
+            "properties": {k: v for k, v in properties.items() if v is not None and v != ""},
+        }
+        ts = _format_posthog_timestamp(row.get("timestamp"))
+        if ts:
+            item["timestamp"] = ts
+        batch.append(item)
+
+    if not batch:
+        return
+
+    payload = {"api_key": POSTHOG_API_KEY, "batch": batch}
+    url = f"{POSTHOG_HOST}/batch/"
+    try:
+        async with httpx.AsyncClient(timeout=POSTHOG_TIMEOUT_S) as client:
+            res = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
+        if res.status_code >= 400:
+            logger.warning("posthog_forward_failed status=%s body=%s", res.status_code, res.text[:500])
+    except Exception as exc:
+        logger.warning("posthog_forward_failed err=%s", getattr(exc, "message", str(exc)))
+
+
+async def _write_events_jsonl_sink(*, rows: list[dict[str, Any]]) -> None:
+    if not EVENTS_JSONL_SINK_DIR:
+        return
+    if not rows:
+        return
+    try:
+        await asyncio.to_thread(_append_events_jsonl_sink, dir_path=EVENTS_JSONL_SINK_DIR, rows=rows)
+    except Exception as exc:
+        logger.warning("events_jsonl_sink_failed err=%s", getattr(exc, "message", str(exc)))
+
+
 @router.post("/events")
 async def ingest_events(
     request: Request,
@@ -1338,6 +1432,7 @@ async def ingest_events(
     user_agent = request.headers.get("user-agent")
 
     accepted = 0
+    rows_to_forward: list[dict[str, Any]] = []
     for raw in events:
         event_name = raw.get("event_name") or raw.get("eventName")
         brief_id = raw.get("brief_id") or raw.get("briefId")
@@ -1358,6 +1453,7 @@ async def ingest_events(
             "user_agent": user_agent,
         }
         logger.info("client_event=%s", row)
+        rows_to_forward.append(row)
         accepted += 1
 
         # Store a small tail for debugging (best-effort).
@@ -1370,6 +1466,12 @@ async def ingest_events(
                 await SESSION_STORE.upsert(row["brief_id"], {"client_events": tail})
             except Exception:
                 pass
+
+    if rows_to_forward:
+        if POSTHOG_API_KEY and POSTHOG_HOST:
+            asyncio.create_task(_forward_events_to_posthog(rows=rows_to_forward))
+        elif EVENTS_JSONL_SINK_DIR:
+            asyncio.create_task(_write_events_jsonl_sink(rows=rows_to_forward))
 
     return {"ok": True, "accepted": accepted}
 

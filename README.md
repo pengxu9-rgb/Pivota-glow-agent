@@ -7,6 +7,7 @@ This service exposes a stable API surface for the frontend:
 - `POST /v1/diagnosis`
 - `POST /v1/photos` (multipart)
 - `POST /v1/photos/sample`
+- `POST /v1/events` (client analytics ingest; optional PostHog forward)
 - `POST /v1/analysis`
 - `POST /v1/analysis/risk`
 - `POST /v1/routine/reorder`
@@ -47,6 +48,7 @@ uvicorn app.main:app --reload --port 8080
 - `PIVOTA_AGENT_API_KEY` = *(optional; if your gateway requires it)*
 - `AURORA_DECISION_BASE_URL` = `https://aurora-beauty-decision-system.vercel.app`
 - `LOG_LEVEL` = `INFO`
+- `POSTHOG_API_KEY` / `POSTHOG_HOST` = *(optional; forwards `/v1/events` to PostHog)*
 
 ### 3) Start command
 
@@ -64,4 +66,3 @@ In `pivota-glow-guide` (Vercel → Environment Variables):
 - `VITE_UPLOAD_ENDPOINT` = *(leave unset; it will fall back to `VITE_API_BASE_URL`)*
 
 Then redeploy `pivota-glow-guide`.
-

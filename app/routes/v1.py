@@ -360,6 +360,49 @@ def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, A
     return {"features": features, "strategy": strategy, "needs_risk_check": needs_risk}
 
 
+def _strategy_from_profile(
+    diagnosis: Optional[dict[str, Any]],
+    detected: Optional[dict[str, Any]] = None,
+) -> str:
+    concerns_raw = diagnosis.get("concerns") if isinstance(diagnosis, dict) else []
+    concerns = {str(c) for c in concerns_raw} if isinstance(concerns_raw, list) else set()
+
+    barrier = None
+    if isinstance(diagnosis, dict):
+        barrier = diagnosis.get("barrierStatus") or diagnosis.get("barrier_status") or diagnosis.get("barrier")
+    barrier = str(barrier).strip().lower() if barrier is not None else "unknown"
+
+    detected = detected if isinstance(detected, dict) else {}
+    oily_acne = bool(detected.get("oily_acne")) or ("acne" in concerns)
+    sensitive = bool(detected.get("sensitive_skin")) or ("redness" in concerns) or barrier == "impaired"
+    barrier_impaired = bool(detected.get("barrier_impaired")) or barrier == "impaired"
+    dark_spots = "dark_spots" in concerns
+    anti_aging = "wrinkles" in concerns
+
+    lines: list[str] = []
+
+    if barrier_impaired or sensitive:
+        lines.append("Barrier-first for 7–10 days: pause strong actives (retinoids, acids, benzoyl peroxide) if you get stinging or peeling.")
+        lines.append("Keep it minimal: AM gentle cleanse (or rinse) → moisturizer → SPF; PM cleanse → moisturizer.")
+
+    if oily_acne:
+        lines.append("For oil + breakouts: introduce ONE acne active at a time (e.g., BHA) 2–3 nights/week, then increase only if your barrier stays calm.")
+        lines.append("Avoid stacking multiple actives in the same night; prioritize consistency + sunscreen.")
+
+    if dark_spots:
+        lines.append("For dark spots: daily SPF is non-negotiable; add one brightening active (e.g., vitamin C or a pigment-safe alternative) once tolerance is confirmed.")
+
+    if anti_aging:
+        lines.append("For fine lines: focus on sunscreen + hydration first; consider a retinoid only after your barrier feels stable (start 2 nights/week).")
+
+    if not lines:
+        lines.append("Keep it simple: AM gentle cleanse → moisturizer → SPF; PM cleanse → moisturizer.")
+        lines.append("If you share your current products, I can flag conflicts and suggest the smallest changes first.")
+
+    # Keep it short for the UI.
+    return " ".join(lines[:5]).strip()
+
+
 def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
@@ -578,6 +621,7 @@ def _analysis_from_aurora_context(
     base = _analysis_from_diagnosis(diagnosis)
     detected = aurora_context.get("detected") if isinstance(aurora_context, dict) else None
     if not isinstance(detected, dict):
+        base["strategy"] = _strategy_from_profile(diagnosis, None)
         return base
 
     features: list[dict[str, Any]] = []
@@ -604,6 +648,10 @@ def _analysis_from_aurora_context(
     merged_features = features + base.get("features", [])
     if merged_features:
         base["features"] = merged_features[:6]
+
+    # Upgrade the default strategy into something more actionable even when we don't have
+    # full CV signals; keep it product-agnostic and barrier-safe.
+    base["strategy"] = _strategy_from_profile(diagnosis, detected)
 
     return base
 

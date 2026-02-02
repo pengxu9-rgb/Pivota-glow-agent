@@ -6,6 +6,7 @@ This service exposes a stable API surface for the frontend:
 
 - `POST /v1/diagnosis`
 - `POST /v1/photos` (multipart)
+- `GET /v1/photos/qc?upload_id=...` (poll QC for pending uploads)
 - `POST /v1/photos/sample`
 - `POST /v1/events` (client analytics ingest; optional PostHog forward)
 - `POST /v1/analysis`

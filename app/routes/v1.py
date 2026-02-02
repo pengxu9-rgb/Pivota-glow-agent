@@ -1102,6 +1102,79 @@ def _looks_like_current_products_review_request(text: str) -> bool:
     ) or any(k in text for k in ["评估我现在用", "分析我现在用", "看看我现在用", "我现在用的护肤品", "现有产品", "现在用的产品"])
 
 
+def _looks_like_product_list_input(text: str, lang_code: Literal["EN", "CN"]) -> bool:
+    """
+    Heuristic: detect when the user is pasting their current products (often as a list),
+    especially after we asked "what are you using now?" in analysis.
+    """
+
+    raw = (text or "").strip()
+    if len(raw) < 30:
+        return False
+
+    lower = raw.lower()
+
+    # List-like formatting is a strong signal.
+    if "\n" in raw:
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            bullet_like = sum(
+                1
+                for ln in lines
+                if ln.startswith(("-", "•", "*", "1.", "2.", "3.", "4.", "am", "pm", "早", "晚"))
+            )
+            if bullet_like >= 1:
+                return True
+
+    keywords_en = [
+        "am",
+        "pm",
+        "morning",
+        "night",
+        "cleanser",
+        "face wash",
+        "toner",
+        "serum",
+        "essence",
+        "moisturizer",
+        "cream",
+        "spf",
+        "sunscreen",
+        "retinol",
+        "tretinoin",
+        "vitamin c",
+        "aha",
+        "bha",
+        "benzoyl",
+        "niacinamide",
+    ]
+    keywords_cn = [
+        "早",
+        "晚",
+        "晨",
+        "夜",
+        "洁面",
+        "洗面奶",
+        "爽肤水",
+        "精华",
+        "面霜",
+        "保湿",
+        "防晒",
+        "a酸",
+        "维a",
+        "果酸",
+        "水杨酸",
+        "过氧化苯甲酰",
+        "烟酰胺",
+    ]
+
+    keywords = keywords_cn if lang_code == "CN" else keywords_en
+    hits = sum(1 for k in keywords if k in lower)
+
+    # Require multiple signals to avoid false positives on normal chat.
+    return hits >= 2
+
+
 def _is_no_products_reply(text: str) -> bool:
     t = text.strip().lower()
     if not t:
@@ -2529,6 +2602,35 @@ async def chat(
     # message is treated as the product list and we answer the *original* request.
     effective_message = message.strip()
     products_review_mode = False
+
+    # After analysis we often ask "what are you using now?". Many users paste their
+    # routine as the next message without explicitly asking for a review. Detect
+    # list-like inputs and treat them as current_products to keep the flow smooth.
+    state = stored.get("state") if isinstance(stored.get("state"), str) else ""
+    if (
+        not current_products_text
+        and not pending
+        and not anchor_product_id
+        and not anchor_product_url
+        and str(state).strip() in {"S5_ANALYSIS_SUMMARY", "S5a_RISK_CHECK", "S6_BUDGET"}
+        and _looks_like_product_list_input(effective_message, lang_code)
+    ):
+        provided = "" if _is_no_products_reply(effective_message) else effective_message
+        current_products_text = provided[:4000] if provided else None
+        products_review_mode = True
+        effective_message = (
+            "Please review my current skincare products and tell me what to keep/change before recommending anything."
+            if lang_code == "EN"
+            else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
+        )
+        await SESSION_STORE.upsert(
+            brief_id,
+            {
+                "trace_id": x_trace_id,
+                "current_products_text": current_products_text,
+            },
+        )
+
     if pending == "current_products":
         provided = "" if _is_no_products_reply(effective_message) else effective_message
         current_products_text = provided[:4000] if provided else None

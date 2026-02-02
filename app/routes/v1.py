@@ -510,6 +510,15 @@ def _analysis_from_diagnosis(diagnosis: Optional[dict[str, Any]]) -> dict[str, A
             }
         )
 
+    # Ensure the card feels informative even when the user provides only 1 concern.
+    if len(features) < 4:
+        features.append(
+            {
+                "observation": "Key unknowns (current products + irritation history) can change the plan — share your cleanser/actives/moisturizer/SPF for a safer, tighter recommendation.",
+                "confidence": "not_sure",
+            }
+        )
+
     strategy = _strategy_from_profile(diagnosis, None)
 
     return {"features": features[:6], "strategy": strategy, "needs_risk_check": needs_risk}

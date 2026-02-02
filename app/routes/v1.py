@@ -1713,8 +1713,19 @@ async def photos_qc(
         timeout_s=DEFAULT_TIMEOUT_S,
     )
 
-    qc_status = result.get("qc_status") or result.get("qcStatus") or result.get("status")
-    qc_advice = result.get("qc_advice") if isinstance(result.get("qc_advice"), dict) else result.get("qcAdvice")
+    raw_qc_status = result.get("qc_status") or result.get("qcStatus")
+    if raw_qc_status is None and isinstance(result.get("qc"), dict):
+        raw_qc_status = result["qc"].get("qc_status") or result["qc"].get("qcStatus")
+
+    qc_status: str = "pending"
+    if isinstance(raw_qc_status, str) and raw_qc_status.strip():
+        normalized = raw_qc_status.strip()
+        if normalized in {"passed", "too_dark", "has_filter", "blurry"}:
+            qc_status = normalized
+
+    qc_advice: Optional[dict[str, Any]] = None
+    if isinstance(result.get("qc"), dict) and isinstance(result["qc"].get("advice"), dict):
+        qc_advice = result["qc"]["advice"]
 
     try:
         stored = await SESSION_STORE.get(brief_id)
@@ -1728,8 +1739,7 @@ async def photos_qc(
                 continue
             slot_upload_id = raw.get("upload_id")
             if isinstance(slot_upload_id, str) and slot_upload_id.strip() == upload_id:
-                if qc_status:
-                    raw["qc_status"] = qc_status
+                raw["qc_status"] = qc_status
                 if isinstance(qc_advice, dict):
                     raw["qc_advice"] = qc_advice
                 updated[slot] = raw

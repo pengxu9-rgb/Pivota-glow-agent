@@ -585,10 +585,47 @@ def _strategy_from_profile(
     if not lines:
         lines.append("Keep it simple: AM gentle cleanse → moisturizer → SPF; PM cleanse → moisturizer.")
 
-    lines.append("If you share what you’re using now (cleanser/actives/moisturizer/SPF), I can flag conflicts and suggest the smallest changes first.")
+    lines.append(
+        "Quick question: what cleanser/actives/moisturizer/SPF are you using right now, and do you ever sting/burn after products?"
+    )
 
     # Keep it short for the UI.
     return " ".join(lines[:6]).strip()
+
+
+def _ensure_strategy_has_question(*, strategy: str, lang_code: Literal["EN", "CN"]) -> str:
+    """
+    The analysis "strategy" must end with a direct question so users know what to do next.
+    Avoid adding fake precision; ask for high-signal missing inputs instead.
+    """
+
+    base = (strategy or "").strip()
+    if not base:
+        base = ""
+
+    # If there's already a question (English or CJK), keep it.
+    if re.search(r"[?？]", base):
+        return base[:900]
+
+    question = (
+        "Quick question: what cleanser/actives/moisturizer/SPF are you using right now, and do you ever sting/burn after products?"
+        if lang_code == "EN"
+        else "快速确认一下：你现在用的洁面/活性（酸/维A/过氧化苯甲酰等）/保湿/防晒分别是什么？用完会刺痛或发红吗？"
+    )
+
+    if not base:
+        return question[:900]
+
+    combined = f"{base.rstrip()} {question}"
+    if len(combined) <= 900:
+        return combined
+
+    max_base_len = 900 - len(question) - 1
+    if max_base_len <= 0:
+        return question[:900]
+
+    trimmed_base = base[:max_base_len].rstrip()
+    return f"{trimmed_base} {question}"
 
 
 def _normalize_analysis_from_llm(obj: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -1554,7 +1591,7 @@ async def analysis(
             + "- DO NOT output any numeric scores/percentages (no “match score”).\n"
             + "- If photos_provided=no: DO NOT make visual claims. Avoid 'looks', 'I see', or 'in the photo'. Base everything on self-report.\n"
             + "- Observations must be about the user's skin goals/safety (barrier, acne risk, pigmentation, irritation, etc.) and include a short reason.\n"
-            + "- Strategy must be actionable and stepwise: (a) what to do for the next 7 days, (b) how to introduce actives safely if relevant, (c) one clarifying question to improve personalization.\n"
+            + "- Strategy must be actionable and stepwise: (a) what to do for the next 7 days, (b) how to introduce actives safely if relevant, (c) END with ONE direct clarifying question (must include a '?' or '？').\n"
             + "- DO NOT recommend specific products/brands yet.\n"
             + "- Keep it concise: 4–6 features; strategy under 900 characters.\n"
             + f"Language: {reply_language}.\n"
@@ -1591,6 +1628,11 @@ async def analysis(
             llm_provider=body.get("llm_provider") if isinstance(body.get("llm_provider"), str) else None,
             llm_model=body.get("llm_model") if isinstance(body.get("llm_model"), str) else None,
         )
+
+    analysis_result["strategy"] = _ensure_strategy_has_question(
+        strategy=str(analysis_result.get("strategy") or ""),
+        lang_code=lang_code,
+    )
 
     patch = {"analysis": analysis_result, "next_state": "S5_ANALYSIS_SUMMARY"}
     await SESSION_STORE.upsert(

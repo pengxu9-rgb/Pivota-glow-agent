@@ -1100,7 +1100,7 @@ async def photos_upload(
     if tasks:
         await asyncio.gather(*tasks)
 
-    # Determine next state using the same gating logic as the frontend.
+    # Determine next state: if any uploaded photo fails QC, keep user in QC retry UI.
     issues = []
     for slot in ("daylight", "indoor_white"):
         raw = merged_photos.get(slot)
@@ -1110,20 +1110,7 @@ async def photos_upload(
         if status and status != "passed":
             issues.append(slot)
     has_issues = len(issues) > 0
-    all_retried = True
-    for slot in issues:
-        raw = merged_photos.get(slot)
-        retry_count = 0
-        if isinstance(raw, dict):
-            try:
-                retry_count = int(raw.get("retry_count") or 0)
-            except Exception:
-                retry_count = 0
-        if retry_count < 1:
-            all_retried = False
-            break
-
-    next_state = "S3a_PHOTO_QC" if has_issues and not all_retried else "S4_ANALYSIS_LOADING"
+    next_state = "S3a_PHOTO_QC" if has_issues else "S4_ANALYSIS_LOADING"
     patch = {"photos": photos_patch, "next_state": next_state}
     await SESSION_STORE.upsert(
         brief_id,

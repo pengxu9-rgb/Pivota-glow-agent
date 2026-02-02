@@ -140,6 +140,96 @@ async def _agent_invoke(operation: str, payload: dict[str, Any], *, timeout_s: f
 
     return data if isinstance(data, dict) else {"data": data}
 
+async def _photos_api_json(
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[dict[str, Any]] = None,
+    params: Optional[dict[str, Any]] = None,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+) -> dict[str, Any]:
+    url = f"{PIVOTA_AGENT_GATEWAY_BASE_URL}{path}"
+    headers: dict[str, str] = {}
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
+    if PIVOTA_AGENT_API_KEY:
+        headers["X-Api-Key"] = PIVOTA_AGENT_API_KEY
+
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        res = await client.request(method, url, headers=headers, json=json_body, params=params)
+
+    try:
+        data = res.json()
+    except Exception:
+        data = {"raw": res.text}
+
+    if res.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail={"upstream": "pivota-agent", "path": path, "status": res.status_code, "body": data},
+        )
+
+    return data if isinstance(data, dict) else {"data": data}
+
+
+async def _upload_photo_via_pivota(
+    *,
+    blob: bytes,
+    content_type: str,
+    file_name: Optional[str],
+    user_id: str,
+) -> dict[str, Any]:
+    presign = await _photos_api_json(
+        "POST",
+        "/photos/presign",
+        json_body={
+            "content_type": content_type,
+            "file_name": file_name,
+            "byte_size": len(blob),
+            "consent": True,
+            "user_id": user_id,
+        },
+        timeout_s=DEFAULT_TIMEOUT_S,
+    )
+    upload_id = str(presign.get("upload_id") or "")
+    upload = presign.get("upload") if isinstance(presign.get("upload"), dict) else {}
+    method = str(upload.get("method") or "PUT").upper()
+    upload_url = str(upload.get("url") or "")
+    upload_headers = upload.get("headers") if isinstance(upload.get("headers"), dict) else {}
+    if not upload_id or not upload_url:
+        raise HTTPException(status_code=502, detail={"error": "UPLOAD_PRESIGN_INVALID", "body": presign})
+    if method != "PUT":
+        raise HTTPException(status_code=502, detail={"error": "UPLOAD_METHOD_UNSUPPORTED", "method": method})
+
+    put_headers = {**{k: str(v) for k, v in upload_headers.items()}, "Content-Type": content_type}
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S) as client:
+        put_res = await client.put(upload_url, headers=put_headers, content=blob)
+    if put_res.status_code not in {200, 201, 204}:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "UPLOAD_FAILED", "status": put_res.status_code, "body": put_res.text[:500]},
+        )
+
+    await _photos_api_json(
+        "POST",
+        "/photos/confirm",
+        json_body={"upload_id": upload_id, "byte_size": len(blob)},
+        timeout_s=DEFAULT_TIMEOUT_S,
+    )
+
+    qc_status: Optional[str] = None
+    qc_advice: Optional[dict[str, Any]] = None
+    # GET /photos/qc lazily computes QC if needed; retry briefly for robustness.
+    for _ in range(6):
+        qc = await _photos_api_json("GET", "/photos/qc", params={"upload_id": upload_id}, timeout_s=DEFAULT_TIMEOUT_S)
+        qc_status = qc.get("qc_status") or (qc.get("qc") or {}).get("qc_status")
+        qc_advice = (qc.get("qc") or {}).get("advice") if isinstance(qc.get("qc"), dict) else None
+        if qc_status:
+            break
+        await asyncio.sleep(0.4)
+
+    return {"upload_id": upload_id, "qc_status": qc_status, "qc_advice": qc_advice}
+
 
 def _guess_category_from_query(query: str) -> str:
     ql = query.lower()
@@ -963,20 +1053,84 @@ async def photos_upload(
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     brief_id = _require_brief_id(x_brief_id)
-    # MVP: accept uploads but do not persist; front-end keeps local previews.
-    photos_patch: dict[str, Any] = {}
-    if daylight is not None:
-        photos_patch["daylight"] = {"qc_status": "passed", "retry_count": 0}
-    if indoor_white is not None:
-        photos_patch["indoor_white"] = {"qc_status": "passed", "retry_count": 0}
+    stored = await SESSION_STORE.get(brief_id)
+    existing_photos = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
 
-    patch = {"photos": photos_patch, "next_state": "S4_ANALYSIS_LOADING"}
+    def _get_retry_count(slot: str) -> int:
+        raw = existing_photos.get(slot) if isinstance(existing_photos, dict) else None
+        if not isinstance(raw, dict):
+            return 0
+        v = raw.get("retry_count", raw.get("retryCount", 0))
+        try:
+            return int(v)
+        except Exception:
+            return 0
+
+    photos_patch: dict[str, Any] = {}
+    merged_photos: dict[str, Any] = dict(existing_photos) if isinstance(existing_photos, dict) else {}
+
+    async def _process(slot: str, upload: UploadFile) -> None:
+        blob = await upload.read()
+        content_type = (upload.content_type or "image/jpeg").strip() or "image/jpeg"
+        result = await _upload_photo_via_pivota(
+            blob=blob,
+            content_type=content_type,
+            file_name=upload.filename,
+            user_id=brief_id,
+        )
+        retry_count = _get_retry_count(slot)
+        if slot in merged_photos:
+            retry_count += 1
+        slot_patch = {
+            "upload_id": result.get("upload_id"),
+            "qc_status": result.get("qc_status") or "blurry",
+            "retry_count": max(0, retry_count),
+        }
+        advice = result.get("qc_advice")
+        if isinstance(advice, dict):
+            slot_patch["qc_advice"] = advice
+        merged_photos[slot] = slot_patch
+        photos_patch[slot] = slot_patch
+
+    tasks = []
+    if daylight is not None:
+        tasks.append(_process("daylight", daylight))
+    if indoor_white is not None:
+        tasks.append(_process("indoor_white", indoor_white))
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    # Determine next state using the same gating logic as the frontend.
+    issues = []
+    for slot in ("daylight", "indoor_white"):
+        raw = merged_photos.get(slot)
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("qc_status") or "").strip()
+        if status and status != "passed":
+            issues.append(slot)
+    has_issues = len(issues) > 0
+    all_retried = True
+    for slot in issues:
+        raw = merged_photos.get(slot)
+        retry_count = 0
+        if isinstance(raw, dict):
+            try:
+                retry_count = int(raw.get("retry_count") or 0)
+            except Exception:
+                retry_count = 0
+        if retry_count < 1:
+            all_retried = False
+            break
+
+    next_state = "S3a_PHOTO_QC" if has_issues and not all_retried else "S4_ANALYSIS_LOADING"
+    patch = {"photos": photos_patch, "next_state": next_state}
     await SESSION_STORE.upsert(
         brief_id,
         {
             "trace_id": x_trace_id,
             "state": patch["next_state"],
-            "photos": photos_patch,
+            "photos": merged_photos,
         },
     )
     return {"session": patch, "next_state": patch["next_state"]}

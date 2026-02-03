@@ -2940,18 +2940,18 @@ async def chat(
 
         if products_review_mode and current_products_text:
             profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget, language=lang_code)
-            query = (
-                f"{sys_prompt}{profile}\n"
-                f"current_products={current_products_text}\n"
-                f"User request: {effective_message}\n"
-                "Task:\n"
-                "1) Evaluate each listed product: keep/adjust/replace + a short reason.\n"
-                "2) Call out conflicts/irritation risks and how to use safely.\n"
-                "3) Then propose a minimal AM/PM skincare regimen that reuses the kept products.\n"
-                "4) Only suggest 1–2 new additions if truly necessary; keep it budget-aware.\n"
-                "5) Use a natural chat style. Do NOT use a rigid template like “Part 1/Part 2/Part 3/Part 4”.\n"
-                f"{reply_instruction}"
+            # IMPORTANT: Aurora routes requests with deterministic heuristics. If we include
+            # words like "review/evaluate/dupe/conflict/frequency", it will often force a
+            # product-eval path and ignore the routine planner. Keep this prompt minimal
+            # and "routine"-oriented so we get a useful plan output.
+            routine_request = (
+                "Build a simple AM/PM routine for me. Keep it minimal and gentle. Reuse my current_products when possible.\n"
+                "If you need 1 missing detail (goal/budget), ask exactly one short question first."
+                if lang_code == "EN"
+                else "请基于我的情况给一套简单的早晚护肤 routine（尽量温和、步骤少），并尽量复用 current_products。\n"
+                     "如果必须补 1 个关键信息（比如目标/预算），请先只问 1 个非常简短的问题。"
             )
+            query = f"{sys_prompt}{profile}\ncurrent_products={current_products_text}\nUser request: {routine_request}\n{reply_instruction}"
         else:
             profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
             products_block = f"\ncurrent_products={current_products_text}\n" if current_products_text else ""

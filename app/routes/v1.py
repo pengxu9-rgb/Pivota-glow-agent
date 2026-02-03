@@ -1185,6 +1185,66 @@ def _is_no_products_reply(text: str) -> bool:
     return any(k in text for k in ["没有", "无", "从零开始", "不用", "没用"])
 
 
+def _normalize_skin_type_answer(text: str, lang_code: Literal["EN", "CN"]) -> Optional[str]:
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    # English
+    if any(k in t for k in ["oily", "oil"]):
+        return "oily"
+    if any(k in t for k in ["dry", "dehydrated"]):
+        return "dry"
+    if "combination" in t or "combo" in t:
+        return "combination"
+    if any(k in t for k in ["sensitive", "reactive"]):
+        return "sensitive"
+    if any(k in t for k in ["not sure", "unsure", "unknown", "idk", "don't know"]):
+        return "unknown"
+
+    # Chinese
+    if any(k in t for k in ["油", "出油"]):
+        return "oily"
+    if any(k in t for k in ["干", "紧绷"]):
+        return "dry"
+    if "混合" in t:
+        return "combination"
+    if any(k in t for k in ["敏感", "泛红", "易红"]):
+        return "sensitive"
+    if any(k in t for k in ["不确定", "不知道", "不清楚", "未知"]):
+        return "unknown"
+
+    return None
+
+
+def _normalize_barrier_answer(text: str, lang_code: Literal["EN", "CN"]) -> Optional[str]:
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    # Options from our UI: No / Mild / Yes / Not sure
+    if any(k in t for k in ["no", "none", "not really", "never"]):
+        return "healthy"
+    if any(k in t for k in ["mild", "sometimes", "a little"]):
+        return "unknown"
+    if any(k in t for k in ["yes", "stinging", "burn", "burning", "redness", "flaking", "peeling", "irritat"]):
+        return "impaired"
+    if any(k in t for k in ["not sure", "unsure", "unknown", "idk", "don't know"]):
+        return "unknown"
+
+    # Chinese
+    if any(k in t for k in ["没有", "不", "不会", "从不"]):
+        return "healthy"
+    if any(k in t for k in ["轻微", "偶尔", "有点"]):
+        return "unknown"
+    if any(k in t for k in ["刺痛", "灼", "红", "脱皮", "起皮", "刺激", "过敏"]):
+        return "impaired"
+    if any(k in t for k in ["不确定", "不知道", "不清楚", "未知"]):
+        return "unknown"
+
+    return None
+
+
 def _looks_like_reco_rationale_request(text: str) -> bool:
     """
     Detect follow-ups like "why these recommendations / what evidence?" so we can
@@ -2599,6 +2659,7 @@ async def chat(
     pending = stored.get("pending_clarification")
     pending_user_request = stored.get("pending_user_request") if isinstance(stored.get("pending_user_request"), str) else None
     pending_request_kind = stored.get("pending_request_kind") if isinstance(stored.get("pending_request_kind"), str) else None
+    pending_profile_field = stored.get("pending_profile_field") if isinstance(stored.get("pending_profile_field"), str) else None
     current_products_text = stored.get("current_products_text") if isinstance(stored.get("current_products_text"), str) else None
 
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
@@ -2613,32 +2674,123 @@ async def chat(
     effective_message = message.strip()
     products_review_mode = False
 
-    # After analysis we often ask "what are you using now?". Many users paste their
-    # routine as the next message without explicitly asking for a review. Detect
-    # list-like inputs and treat them as current_products to keep the flow smooth.
-    state = stored.get("state") if isinstance(stored.get("state"), str) else ""
-    if (
-        not current_products_text
-        and not pending
-        and not anchor_product_id
-        and not anchor_product_url
-        and str(state).strip() in {"S5_ANALYSIS_SUMMARY", "S5a_RISK_CHECK", "S6_BUDGET"}
-        and _looks_like_product_list_input(effective_message, lang_code)
-    ):
-        provided = "" if _is_no_products_reply(effective_message) else effective_message
-        current_products_text = provided[:4000] if provided else None
+    def _clarify_skin_type() -> dict[str, Any]:
+        question = "Which skin type fits you best?" if lang_code == "EN" else "你的肤质更接近哪一种？"
+        options = ["Oily", "Dry", "Combination", "Sensitive", "Not sure"] if lang_code == "EN" else ["油皮", "干皮", "混合皮", "敏感肌", "不确定"]
+        answer = "One quick question so I can answer accurately:" if lang_code == "EN" else "为了给你更准确的建议，我需要先确认一项信息："
+        return {
+            "answer": answer,
+            "intent": "clarify",
+            "clarification": {"questions": [{"id": "skin_type", "question": question, "options": options}], "missing_fields": ["skinType"]},
+            "context": None,
+        }
+
+    def _clarify_barrier() -> dict[str, Any]:
+        question = (
+            "Lately, do you get stinging/redness/flaking (possible barrier stress)?"
+            if lang_code == "EN"
+            else "最近你会刺痛/泛红/起皮吗？（可能是屏障压力）"
+        )
+        options = ["No", "Mild", "Yes (stinging/redness)", "Not sure"] if lang_code == "EN" else ["没有", "轻微", "有（刺痛/泛红）", "不确定"]
+        answer = "One quick question so I can answer accurately:" if lang_code == "EN" else "为了给你更准确的建议，我需要再确认一项信息："
+        return {
+            "answer": answer,
+            "intent": "clarify",
+            "clarification": {"questions": [{"id": "barrier_status", "question": question, "options": options}], "missing_fields": ["barrierStatus"]},
+            "context": None,
+        }
+
+    # If we captured a routine list first, we may need to collect minimal skin profile
+    # before we can safely review/compare products.
+    if pending == "skin_profile_for_products":
+        field = pending_profile_field or "skinType"
+        diag = diagnosis_payload if isinstance(diagnosis_payload, dict) else {}
+        diagnosis_payload = {
+            "skinType": diag.get("skinType"),
+            "concerns": diag.get("concerns") if isinstance(diag.get("concerns"), list) else [],
+            "currentRoutine": diag.get("currentRoutine") or "basic",
+            "barrierStatus": diag.get("barrierStatus") or "unknown",
+        }
+
+        if field == "skinType":
+            parsed = _normalize_skin_type_answer(effective_message, lang_code)
+            if not parsed:
+                return _clarify_skin_type()
+            diagnosis_payload["skinType"] = parsed
+            await SESSION_STORE.upsert(
+                brief_id,
+                {
+                    "trace_id": x_trace_id,
+                    "diagnosis": diagnosis_payload,
+                    "pending_clarification": "skin_profile_for_products",
+                    "pending_profile_field": "barrierStatus",
+                },
+            )
+            return _clarify_barrier()
+
+        parsed = _normalize_barrier_answer(effective_message, lang_code)
+        if not parsed:
+            return _clarify_barrier()
+
+        diagnosis_payload["barrierStatus"] = parsed
+        await SESSION_STORE.upsert(
+            brief_id,
+            {
+                "trace_id": x_trace_id,
+                "diagnosis": diagnosis_payload,
+                "pending_clarification": None,
+                "pending_profile_field": None,
+                "pending_user_request": None,
+                "pending_request_kind": None,
+            },
+        )
         products_review_mode = True
         effective_message = (
             "Please review my current skincare products and tell me what to keep/change before recommending anything."
             if lang_code == "EN"
             else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
         )
+
+    # Users often paste their routine list directly. Capture it and (if needed) ask for
+    # the minimal skin profile to evaluate safely.
+    if (
+        not current_products_text
+        and not pending
+        and not anchor_product_id
+        and not anchor_product_url
+        and _looks_like_product_list_input(effective_message, lang_code)
+    ):
+        provided = "" if _is_no_products_reply(effective_message) else effective_message
+        current_products_text = provided[:4000] if provided else None
+
         await SESSION_STORE.upsert(
             brief_id,
             {
                 "trace_id": x_trace_id,
                 "current_products_text": current_products_text,
             },
+        )
+
+        diag = diagnosis_payload if isinstance(diagnosis_payload, dict) else {}
+        has_skin = isinstance(diag.get("skinType"), str) and str(diag.get("skinType") or "").strip()
+        has_barrier = isinstance(diag.get("barrierStatus"), str) and str(diag.get("barrierStatus") or "").strip()
+
+        if not has_skin or not has_barrier:
+            await SESSION_STORE.upsert(
+                brief_id,
+                {
+                    "trace_id": x_trace_id,
+                    "pending_clarification": "skin_profile_for_products",
+                    "pending_profile_field": "skinType",
+                },
+            )
+            return _clarify_skin_type()
+
+        products_review_mode = True
+        effective_message = (
+            "Please review my current skincare products and tell me what to keep/change before recommending anything."
+            if lang_code == "EN"
+            else "在推荐之前，请先评估我现在用的护肤品：哪些适合保留，哪些需要替换/注意。"
         )
 
     if pending == "current_products":

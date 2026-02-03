@@ -876,6 +876,7 @@ def _aurora_profile_sentence(
     diagnosis: Optional[dict[str, Any]],
     market: str,
     budget: str,
+    language: Literal["EN", "CN"] = "EN",
 ) -> str:
     skin_type = None
     concerns: list[str] = []
@@ -888,20 +889,35 @@ def _aurora_profile_sentence(
             concerns = [str(c) for c in concerns_raw if c]
         barrier_status = diagnosis.get("barrierStatus") or diagnosis.get("barrier_status") or diagnosis.get("barrier")
 
-    # Map front-end concern IDs to keywords Aurora's routine planner reliably detects.
-    # (Aurora's current clarify logic is keyword-based; include bilingual hints for robustness.)
-    alias_map = {
-        "acne": "acne (痘痘)",
-        "dark_spots": "dark spots / hyperpigmentation (淡斑/痘印)",
-        "dullness": "brightening (提亮/美白)",
-        "wrinkles": "anti-aging (抗老/细纹)",
-        "aging": "anti-aging (抗老/细纹)",
-        "pores": "closed comedones / rough texture (闭口/黑头/粗糙)",
-        "redness": "redness / sensitive skin (泛红敏感)",
-        "dehydration": "hydration + repair (补水修护)",
-        "repair": "barrier repair (屏障修护)",
-        "barrier": "barrier repair (屏障修护)",
+    # Map front-end concern IDs to keywords Aurora reliably detects.
+    #
+    # IMPORTANT: Keep EN prompts English-only. Injecting Chinese here will often flip
+    # Aurora into Chinese output even when we ask for English.
+    alias_map_en = {
+        "acne": "acne",
+        "dark_spots": "dark spots / hyperpigmentation",
+        "dullness": "brightening",
+        "wrinkles": "anti-aging",
+        "aging": "anti-aging",
+        "pores": "closed comedones / rough texture",
+        "redness": "redness / sensitive skin",
+        "dehydration": "hydration + barrier repair",
+        "repair": "barrier repair",
+        "barrier": "barrier repair",
     }
+    alias_map_cn = {
+        "acne": "痘痘/闭口",
+        "dark_spots": "淡斑/痘印",
+        "dullness": "提亮/暗沉",
+        "wrinkles": "抗老/细纹",
+        "aging": "抗老/细纹",
+        "pores": "闭口/黑头/粗糙",
+        "redness": "泛红/敏感",
+        "dehydration": "补水/修护",
+        "repair": "屏障修护",
+        "barrier": "屏障修护",
+    }
+    alias_map = alias_map_cn if language == "CN" else alias_map_en
 
     normalized: list[str] = []
     for c in concerns:
@@ -916,19 +932,50 @@ def _aurora_profile_sentence(
         seen.add(c)
         deduped.append(c)
 
-    concerns_str = ", ".join(deduped) if deduped else "none"
-    skin_str = str(skin_type or "unknown")
-    barrier_norm = str(barrier_status or "").strip().lower()
-    if barrier_norm in {"healthy", "stable", "ok", "good"}:
-        barrier_str = "Stable barrier (no stinging/redness) / 屏障稳定"
-    elif barrier_norm in {"impaired", "sensitive", "reactive"}:
-        barrier_str = "Impaired barrier (stinging/redness) / 刺痛泛红，屏障受损"
-    elif barrier_norm in {"unknown", "unsure", "not sure", "n/a"}:
-        barrier_str = "Barrier status unknown (not sure) / 不确定屏障状态"
-    else:
-        barrier_str = str(barrier_status or "unknown")
+    concerns_str = ", ".join(deduped) if deduped else ("无" if language == "CN" else "none")
 
-    return f"User profile: skin type {skin_str}; barrier status: {barrier_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
+    skin_norm = str(skin_type or "").strip().lower()
+    if language == "CN":
+        skin_str = {
+            "oily": "油皮",
+            "dry": "干皮",
+            "combination": "混合皮",
+            "normal": "中性",
+            "sensitive": "敏感肌",
+            "unknown": "不确定",
+        }.get(skin_norm, skin_norm or "不确定")
+    else:
+        skin_str = {
+            "oily": "oily skin",
+            "dry": "dry skin",
+            "combination": "combination skin",
+            "normal": "normal skin",
+            "sensitive": "sensitive skin",
+            "unknown": "unknown skin type",
+        }.get(skin_norm, skin_norm or "unknown skin type")
+
+    barrier_norm = str(barrier_status or "").strip().lower()
+    if language == "CN":
+        if barrier_norm in {"healthy", "stable", "ok", "good"}:
+            barrier_str = "屏障稳定（无明显刺痛/泛红）"
+        elif barrier_norm in {"impaired", "sensitive", "reactive"}:
+            barrier_str = "屏障受损（刺痛/泛红）"
+        elif barrier_norm in {"unknown", "unsure", "not sure", "n/a"}:
+            barrier_str = "不确定"
+        else:
+            barrier_str = str(barrier_status or "不确定")
+        return f"用户画像：肤质={skin_str}；屏障={barrier_str}；关注点={concerns_str}；地区={market}；预算={budget}。"
+
+    if barrier_norm in {"healthy", "stable", "ok", "good"}:
+        barrier_str = "stable barrier (no stinging/redness)"
+    elif barrier_norm in {"impaired", "sensitive", "reactive"}:
+        barrier_str = "impaired barrier (stinging/redness)"
+    elif barrier_norm in {"unknown", "unsure", "not sure", "n/a"}:
+        barrier_str = "unknown barrier status"
+    else:
+        barrier_str = str(barrier_status or "unknown barrier status")
+
+    return f"User profile: I have {skin_str}; barrier: {barrier_str}; concerns: {concerns_str}; region: {market}; budget: {budget}."
 
 def _normalize_clarification(clarification: Any, *, language: Literal["EN", "CN"]) -> Any:
     if not isinstance(clarification, dict):
@@ -2119,7 +2166,7 @@ async def routine_reorder(
             payload = await aurora_chat(
                 base_url=AURORA_DECISION_BASE_URL,
                 query=(
-                    f"{_aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)}\n"
+                    f"{_aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget, language='EN')}\n"
                     f"Goal: {goal_note}.\n"
                     f"{products_note}"
                     f"Preference: {preference_note}.\n"
@@ -2870,7 +2917,7 @@ async def chat(
         }
 
     if isinstance(anchor_product_id, str) and anchor_product_id.strip():
-        profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
+        profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget, language=lang_code)
         query = (
             f"{sys_prompt}{profile}\n"
             f"User question: {effective_message}\n"
@@ -2892,7 +2939,7 @@ async def chat(
             products_review_mode = True
 
         if products_review_mode and current_products_text:
-            profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget)
+            profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget, language=lang_code)
             query = (
                 f"{sys_prompt}{profile}\n"
                 f"current_products={current_products_text}\n"

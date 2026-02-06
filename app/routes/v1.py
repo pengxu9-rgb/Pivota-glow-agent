@@ -1688,6 +1688,24 @@ class SessionBootstrapResponse(BaseModel):
     artifacts_present: SessionBootstrapArtifactsPresent = Field(default_factory=SessionBootstrapArtifactsPresent)
 
 
+class QuickProfilePatchRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    skin_feel: Optional[Literal["oily", "dry", "combination", "unsure"]] = None
+    goal_primary: Optional[Literal["breakouts", "brightening", "antiaging", "barrier", "spf", "other"]] = None
+    sensitivity_flag: Optional[Literal["yes", "no", "unsure"]] = None
+    routine_complexity: Optional[Literal["0-2", "3-5", "6+"]] = None
+    rx_flag: Optional[Literal["yes", "no", "unsure"]] = None
+
+
+class SessionProfilePatchResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ok: bool = True
+    schema_version: str = Field(default="0.1")
+    session: SessionData
+
+
 def _normalize_lang(raw: Optional[str]) -> Literal["en", "cn"]:
     value = (raw or "").strip().lower()
     if value in {"cn", "zh", "zh-cn", "zh_cn", "zh-hans", "zh_hans"}:
@@ -1696,6 +1714,21 @@ def _normalize_lang(raw: Optional[str]) -> Literal["en", "cn"]:
 
 
 def _extract_goal_primary(session: SessionData) -> Optional[str]:
+    profile = session.profile or {}
+    if isinstance(profile, dict):
+        for key in ("goal_primary", "goalPrimary", "primary_goal", "primaryGoal"):
+            v = profile.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:120]
+
+        for key in ("concerns", "goals"):
+            v = profile.get(key)
+            if isinstance(v, list) and v:
+                first = str(v[0]).strip()
+                return first or None
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:120]
+
     goals = session.goals
     if isinstance(goals, list) and goals:
         first = str(goals[0]).strip()
@@ -1709,16 +1742,6 @@ def _extract_goal_primary(session: SessionData) -> Optional[str]:
         if isinstance(goals.get("items"), list) and goals["items"]:
             first = str(goals["items"][0]).strip()
             return first or None
-
-    profile = session.profile or {}
-    if isinstance(profile, dict):
-        for key in ("concerns", "goals"):
-            v = profile.get(key)
-            if isinstance(v, list) and v:
-                first = str(v[0]).strip()
-                return first or None
-            if isinstance(v, str) and v.strip():
-                return v.strip()[:120]
 
     return None
 
@@ -1888,6 +1911,24 @@ async def session_bootstrap(
     response.summary = summary
     response.artifacts_present = artifacts_present
     return response
+
+
+@router.post("/session/profile/patch", response_model=SessionProfilePatchResponse)
+async def session_profile_patch(
+    body: QuickProfilePatchRequest,
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+):
+    uid = (x_aurora_uid or "").strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing X-Aurora-Uid")
+
+    profile_patch = body.model_dump(exclude_unset=True)
+    now_dt = datetime.now(timezone.utc)
+    session = await PERSISTENT_SESSION_STORE.patch(
+        uid,
+        SessionDataPatch(profile=profile_patch, last_seen_at=now_dt),
+    )
+    return SessionProfilePatchResponse(ok=True, session=session)
 
 
 @router.post("/diagnosis")

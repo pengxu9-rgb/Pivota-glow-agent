@@ -18,6 +18,7 @@ from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Request,
 
 from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
+from app.store.session_store import PERSISTENT_SESSION_STORE, SCHEMA_VERSION as SESSION_SCHEMA_VERSION, SessionDataPatch, build_session_summary
 
 
 router = APIRouter()
@@ -1656,11 +1657,53 @@ async def ingest_events(
     return {"ok": True, "accepted": accepted}
 
 
+@router.get("/session/bootstrap")
+async def session_bootstrap(
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+):
+    uid = (x_aurora_uid or "").strip()
+    if not uid:
+        return {
+            "ok": True,
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "has_session": False,
+            "session": None,
+            "summary": None,
+        }
+
+    session = await PERSISTENT_SESSION_STORE.get(uid)
+    if not session:
+        return {
+            "ok": True,
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "has_session": False,
+            "session": None,
+            "summary": None,
+        }
+
+    summary = build_session_summary(session)
+
+    # Best-effort: update last_seen_at for next visit's days_since_last.
+    try:
+        await PERSISTENT_SESSION_STORE.patch(uid, SessionDataPatch(last_seen_at=datetime.now(timezone.utc)))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "schema_version": SESSION_SCHEMA_VERSION,
+        "has_session": True,
+        "session": session.model_dump(mode="json"),
+        "summary": summary.model_dump(mode="json"),
+    }
+
+
 @router.post("/diagnosis")
 async def diagnosis(
     body: dict[str, Any],
     x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
 ):
     brief_id = _require_brief_id(x_brief_id)
     skipped = bool(body.get("skipped", False))
@@ -1691,6 +1734,29 @@ async def diagnosis(
             **patch,
         },
     )
+
+    uid = (x_aurora_uid or "").strip()
+    if uid:
+        profile_patch = {
+            "skin_type": diagnosis_payload.get("skinType"),
+            "concerns": diagnosis_payload.get("concerns"),
+            "current_routine": diagnosis_payload.get("currentRoutine"),
+            "barrier_status": diagnosis_payload.get("barrierStatus"),
+        }
+        goals = diagnosis_payload.get("concerns")
+        try:
+            await PERSISTENT_SESSION_STORE.patch(
+                uid,
+                SessionDataPatch(
+                    profile=profile_patch,
+                    goals=goals if isinstance(goals, list) else None,
+                    last_state=patch.get("next_state"),
+                    last_seen_at=datetime.now(timezone.utc),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("persistent_session_store_patch_failed err=%s", getattr(exc, "message", str(exc)))
+
     return {"session": patch, "next_state": patch["next_state"]}
 
 

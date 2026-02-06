@@ -4,6 +4,7 @@ FastAPI orchestrator for the `pivota-glow-guide` frontend.
 
 This service exposes a stable API surface for the frontend:
 
+- `GET /v1/session/bootstrap`
 - `POST /v1/diagnosis`
 - `POST /v1/photos` (multipart)
 - `GET /v1/photos/qc?upload_id=...` (poll QC for pending uploads)

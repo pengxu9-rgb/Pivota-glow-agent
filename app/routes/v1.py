@@ -15,10 +15,11 @@ from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Request, UploadFile
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.aurora import aurora_chat, extract_json_object
 from app.services.session_store import SESSION_STORE
-from app.store.session_store import PERSISTENT_SESSION_STORE, SCHEMA_VERSION as SESSION_SCHEMA_VERSION, SessionDataPatch, build_session_summary
+from app.store.session_store import PERSISTENT_SESSION_STORE, SessionData, SessionDataPatch
 
 
 router = APIRouter()
@@ -1657,45 +1658,236 @@ async def ingest_events(
     return {"ok": True, "accepted": accepted}
 
 
-@router.get("/session/bootstrap")
+class SessionBootstrapSummary(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    goal_primary: Optional[str] = None
+    plan_am_short: list[str] = Field(default_factory=list)
+    plan_pm_short: list[str] = Field(default_factory=list)
+    sensitivities: list[str] = Field(default_factory=list)
+    last_seen_at: Optional[datetime] = None
+    days_since_last: Optional[int] = None
+    checkin_due: bool = False
+
+
+class SessionBootstrapArtifactsPresent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    has_profile: bool = False
+    has_products: bool = False
+    has_plan: bool = False
+
+
+class SessionBootstrapResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    is_returning: bool
+    aurora_uid: str
+    lang: Literal["en", "cn"]
+    summary: SessionBootstrapSummary = Field(default_factory=SessionBootstrapSummary)
+    artifacts_present: SessionBootstrapArtifactsPresent = Field(default_factory=SessionBootstrapArtifactsPresent)
+
+
+def _normalize_lang(raw: Optional[str]) -> Literal["en", "cn"]:
+    value = (raw or "").strip().lower()
+    if value in {"cn", "zh", "zh-cn", "zh_cn", "zh-hans", "zh_hans"}:
+        return "cn"
+    return "en"
+
+
+def _extract_goal_primary(session: SessionData) -> Optional[str]:
+    goals = session.goals
+    if isinstance(goals, list) and goals:
+        first = str(goals[0]).strip()
+        return first or None
+    if isinstance(goals, str):
+        return goals.strip() or None
+    if isinstance(goals, dict):
+        for key in ("goal_primary", "primary", "goal", "primary_goal"):
+            if isinstance(goals.get(key), str) and goals[key].strip():
+                return goals[key].strip()[:120]
+        if isinstance(goals.get("items"), list) and goals["items"]:
+            first = str(goals["items"][0]).strip()
+            return first or None
+
+    profile = session.profile or {}
+    if isinstance(profile, dict):
+        for key in ("concerns", "goals"):
+            v = profile.get(key)
+            if isinstance(v, list) and v:
+                first = str(v[0]).strip()
+                return first or None
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:120]
+
+    return None
+
+
+def _coerce_step_label(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("label", "name", "title", "step", "category"):
+            v = value.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _extract_plan_short(plan: Any, *, key: Literal["am", "pm"]) -> list[str]:
+    if not plan:
+        return []
+    if not isinstance(plan, dict):
+        return []
+
+    candidates: list[Any] = []
+    if key == "am":
+        candidates = [
+            plan.get("am"),
+            plan.get("AM"),
+            plan.get("morning"),
+            plan.get("steps_am"),
+            plan.get("am_steps"),
+            plan.get("plan_am"),
+        ]
+    else:
+        candidates = [
+            plan.get("pm"),
+            plan.get("PM"),
+            plan.get("night"),
+            plan.get("steps_pm"),
+            plan.get("pm_steps"),
+            plan.get("plan_pm"),
+        ]
+
+    steps: list[Any] = []
+    for c in candidates:
+        if isinstance(c, list):
+            steps = c
+            break
+        if isinstance(c, dict):
+            for subkey in ("steps", "items", "short"):
+                if isinstance(c.get(subkey), list):
+                    steps = c[subkey]
+                    break
+            if steps:
+                break
+
+    labels: list[str] = []
+    for step in steps:
+        label = _coerce_step_label(step)
+        if not label:
+            continue
+        if label in labels:
+            continue
+        labels.append(label[:120])
+        if len(labels) >= 8:
+            break
+
+    return labels
+
+
+def _extract_sensitivities(session: SessionData) -> list[str]:
+    raw = session.sensitivities
+    if raw is None and isinstance(session.profile, dict):
+        raw = session.profile.get("sensitivities") or session.profile.get("sensitivity")
+
+    values: list[str] = []
+    if isinstance(raw, list):
+        values = [str(v).strip() for v in raw if str(v).strip()]
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text:
+            if any(sep in text for sep in [",", ";", "|", "，", "；"]):
+                parts = re.split(r"[,;|，；]+", text)
+                values = [p.strip() for p in parts if p.strip()]
+            else:
+                values = [text]
+    elif isinstance(raw, dict):
+        items = raw.get("items") or raw.get("sensitivities")
+        if isinstance(items, list):
+            values = [str(v).strip() for v in items if str(v).strip()]
+
+    deduped: list[str] = []
+    for v in values:
+        if v in deduped:
+            continue
+        deduped.append(v[:120])
+        if len(deduped) >= 12:
+            break
+    return deduped
+
+
+@router.get("/session/bootstrap", response_model=SessionBootstrapResponse)
 async def session_bootstrap(
+    brief_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+    x_aurora_lang: Optional[str] = Header(default=None, alias="X-Aurora-Lang"),
 ):
+    _ = (brief_id, session_id)  # Reserved for future compatibility.
+
     uid = (x_aurora_uid or "").strip()
+    lang = _normalize_lang(x_aurora_lang)
+
+    response = SessionBootstrapResponse(
+        is_returning=False,
+        aurora_uid=uid or "",
+        lang=lang,
+    )
+
     if not uid:
-        return {
-            "ok": True,
-            "schema_version": SESSION_SCHEMA_VERSION,
-            "has_session": False,
-            "session": None,
-            "summary": None,
-        }
+        return response
 
     session = await PERSISTENT_SESSION_STORE.get(uid)
     if not session:
-        return {
-            "ok": True,
-            "schema_version": SESSION_SCHEMA_VERSION,
-            "has_session": False,
-            "session": None,
-            "summary": None,
-        }
+        return response
 
-    summary = build_session_summary(session)
+    now_dt = datetime.now(timezone.utc)
+
+    last_seen_at = session.last_seen_at
+    if last_seen_at and last_seen_at.tzinfo is None:
+        last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+
+    days_since_last: Optional[int] = None
+    if last_seen_at:
+        delta = now_dt - last_seen_at.astimezone(timezone.utc)
+        days_since_last = max(0, int(delta.total_seconds() // 86400))
+
+    checkin_due = False
+    last_checkin_at = session.last_checkin_at
+    if last_checkin_at:
+        if last_checkin_at.tzinfo is None:
+            last_checkin_at = last_checkin_at.replace(tzinfo=timezone.utc)
+        delta = now_dt - last_checkin_at.astimezone(timezone.utc)
+        checkin_due = delta.total_seconds() >= 14 * 86400
+
+    summary = SessionBootstrapSummary(
+        goal_primary=_extract_goal_primary(session),
+        plan_am_short=_extract_plan_short(session.minimal_plan, key="am"),
+        plan_pm_short=_extract_plan_short(session.minimal_plan, key="pm"),
+        sensitivities=_extract_sensitivities(session),
+        last_seen_at=last_seen_at,
+        days_since_last=days_since_last,
+        checkin_due=checkin_due,
+    )
+
+    artifacts_present = SessionBootstrapArtifactsPresent(
+        has_profile=bool(session.profile),
+        has_products=bool(session.current_products),
+        has_plan=bool(session.minimal_plan),
+    )
 
     # Best-effort: update last_seen_at for next visit's days_since_last.
     try:
-        await PERSISTENT_SESSION_STORE.patch(uid, SessionDataPatch(last_seen_at=datetime.now(timezone.utc)))
+        await PERSISTENT_SESSION_STORE.patch(uid, SessionDataPatch(last_seen_at=now_dt))
     except Exception:
         pass
 
-    return {
-        "ok": True,
-        "schema_version": SESSION_SCHEMA_VERSION,
-        "has_session": True,
-        "session": session.model_dump(mode="json"),
-        "summary": summary.model_dump(mode="json"),
-    }
+    response.is_returning = True
+    response.summary = summary
+    response.artifacts_present = artifacts_present
+    return response
 
 
 @router.post("/diagnosis")

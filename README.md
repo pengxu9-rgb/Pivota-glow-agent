@@ -31,6 +31,8 @@ pip install -r requirements.txt
 export CORS_ORIGINS="http://localhost:5173,https://pivota-glow-guide.vercel.app"
 export PIVOTA_AGENT_GATEWAY_BASE_URL="https://pivota-agent-production.up.railway.app"
 export AURORA_DECISION_BASE_URL="https://aurora-beauty-decision-system.vercel.app"
+export REDIS_URL="redis://localhost:6379/0"  # optional; enables persistent session store
+export SESSION_TTL_DAYS="30"                 # optional; default is 30
 
 uvicorn app.main:app --reload --port 8080
 ```
@@ -50,6 +52,8 @@ uvicorn app.main:app --reload --port 8080
 - `AURORA_DECISION_BASE_URL` = `https://aurora-beauty-decision-system.vercel.app`
 - `LOG_LEVEL` = `INFO`
 - `POSTHOG_API_KEY` / `POSTHOG_HOST` = *(optional; forwards `/v1/events` to PostHog)*
+- `REDIS_URL` = *(recommended; enables persistent session store keyed by `aurora_uid`)*
+- `SESSION_TTL_DAYS` = *(optional; default `30`)*
 
 ### 3) Start command
 

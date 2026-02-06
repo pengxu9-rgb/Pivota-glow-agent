@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.health import router as health_router
 from app.routes.v1 import router as v1_router
+from app.store.session_store import PERSISTENT_SESSION_STORE
 
 DEFAULT_CORS_ORIGINS = [
     # Production chatbox custom domain (Vercel).
@@ -69,6 +70,15 @@ def _setup_logging() -> None:
 def create_app() -> FastAPI:
     _setup_logging()
     app = FastAPI(title="Pivota Glow Agent", version="0.1.0")
+
+    async def _startup() -> None:
+        await PERSISTENT_SESSION_STORE.initialize()
+
+    async def _shutdown() -> None:
+        await PERSISTENT_SESSION_STORE.close()
+
+    app.add_event_handler("startup", _startup)
+    app.add_event_handler("shutdown", _shutdown)
 
     origins = _parse_cors_origins(os.getenv("CORS_ORIGINS"))
     allow_all = "*" in origins

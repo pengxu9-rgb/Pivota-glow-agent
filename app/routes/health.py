@@ -4,6 +4,8 @@ import os
 
 from fastapi import APIRouter
 
+from app.store.session_store import PERSISTENT_SESSION_STORE
+
 router = APIRouter()
 
 
@@ -33,4 +35,5 @@ def healthz():
         "service": "pivota-glow-agent",
         "commit_sha": _get_commit_sha(),
         "environment": os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("ENVIRONMENT"),
+        "persistent_session_store_backend": PERSISTENT_SESSION_STORE.backend_kind,
     }

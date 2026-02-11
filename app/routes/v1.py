@@ -18,6 +18,11 @@ from fastapi import APIRouter, Body, File, Form, Header, HTTPException, Request,
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.services.aurora import aurora_chat, extract_json_object
+from app.services.pdp_open import (
+    build_direct_pdp_target,
+    normalize_reason_code as normalize_pdp_reason_code,
+    resolve_pdp_open_contract,
+)
 from app.services.session_store import SESSION_STORE
 from app.store.session_store import PERSISTENT_SESSION_STORE, SessionData, SessionDataPatch
 
@@ -35,6 +40,7 @@ USE_PIVOTA_AGENT_SEARCH = (os.getenv("USE_PIVOTA_AGENT_SEARCH") or "").strip().l
 
 DEFAULT_TIMEOUT_S = float(os.getenv("UPSTREAM_TIMEOUT_S") or "10")
 OFFERS_RESOLVE_TIMEOUT_S = float(os.getenv("OFFERS_RESOLVE_TIMEOUT_S") or "55")
+PDP_RESOLVE_TIMEOUT_S = float(os.getenv("PDP_RESOLVE_TIMEOUT_S") or "2.5")
 
 # Optional analytics forwarding.
 POSTHOG_API_KEY = (os.getenv("POSTHOG_API_KEY") or "").strip() or None
@@ -80,7 +86,7 @@ def _map_product(category: str, p: dict[str, Any]) -> dict[str, Any]:
         if isinstance(imgs, list) and imgs and isinstance(imgs[0], str):
             image_url = imgs[0]
 
-    return {
+    mapped: dict[str, Any] = {
         "sku_id": sku_id,
         "name": name,
         "brand": brand,
@@ -88,7 +94,29 @@ def _map_product(category: str, p: dict[str, Any]) -> dict[str, Any]:
         "description": description[:2000],
         "image_url": image_url or "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
         "size": "1 unit",
+        "legacy_authoritative": False,
+        "legacy_refs": {
+            "sku_id": sku_id,
+            "product_id": p.get("product_id") or p.get("id"),
+            "merchant_id": p.get("merchant_id") or p.get("merchantId"),
+            "product_group_id": p.get("product_group_id") or p.get("productGroupId"),
+            "subject": p.get("subject") if isinstance(p.get("subject"), dict) else None,
+            "canonical_product_ref": p.get("canonical_product_ref") if isinstance(p.get("canonical_product_ref"), dict) else None,
+            "product_ref": p.get("product_ref") if isinstance(p.get("product_ref"), dict) else None,
+            "authoritative": False,
+        },
     }
+    direct_target = build_direct_pdp_target(
+        {
+            **p,
+            "brand": brand,
+            "name": name,
+            "display": {"title": f"{brand} {name}".strip()},
+        }
+    )
+    if direct_target:
+        mapped["pdp_target"] = direct_target
+    return mapped
 
 
 def _map_offer(p: dict[str, Any], *, sku_id: str) -> dict[str, Any]:
@@ -151,6 +179,78 @@ async def _agent_invoke(operation: str, payload: dict[str, Any], *, timeout_s: f
         )
 
     return data if isinstance(data, dict) else {"data": data}
+
+
+async def _resolve_products_once_for_pdp(
+    *,
+    query: str,
+    lang: Literal["en", "cn"],
+    hints: Optional[dict[str, Any]],
+    brief_id: Optional[str],
+    trace_id: Optional[str],
+    aurora_uid: Optional[str],
+    request_id: Optional[str],
+) -> dict[str, Any]:
+    q = str(query or "").strip()
+    if not q:
+        return {"resolved": False, "reason_code": "invalid_id"}
+
+    url = f"{PIVOTA_AGENT_GATEWAY_BASE_URL}/agent/v1/products/resolve"
+    headers = {"Content-Type": "application/json"}
+    if PIVOTA_AGENT_API_KEY:
+        headers["X-Api-Key"] = PIVOTA_AGENT_API_KEY
+
+    req_payload: dict[str, Any] = {
+        "query": q,
+        "lang": "cn" if lang == "cn" else "en",
+        "caller": "pivota_glow_agent",
+        "session_id": str(brief_id or ""),
+        "options": {
+            "timeout_ms": int(PDP_RESOLVE_TIMEOUT_S * 1000),
+            "upstream_retries": 0,
+            "search_all_merchants": True,
+            "allow_external_seed": False,
+        },
+    }
+    if isinstance(hints, dict) and hints:
+        req_payload["hints"] = hints
+
+    try:
+        async with httpx.AsyncClient(timeout=PDP_RESOLVE_TIMEOUT_S) as client:
+            res = await client.post(url, headers=headers, json=req_payload)
+    except httpx.TimeoutException:
+        return {"resolved": False, "reason_code": "upstream_timeout"}
+    except Exception:
+        return {"resolved": False, "reason_code": "db_timeout"}
+
+    try:
+        data = res.json()
+    except Exception:
+        data = {"raw": res.text}
+
+    if not isinstance(data, dict):
+        data = {"resolved": False, "reason_code": "fallback_external"}
+
+    if res.status_code >= 500:
+        data["resolved"] = False
+        data["reason_code"] = "db_timeout"
+    elif res.status_code >= 400:
+        data["resolved"] = False
+        data["reason_code"] = "invalid_id"
+    elif data.get("resolved") is False and not data.get("reason_code"):
+        data["reason_code"] = "no_candidates"
+
+    logger.info(
+        "pdp_resolve_once request_id=%s trace_id=%s brief_id=%s aurora_uid=%s query=%r resolved=%s reason_code=%s",
+        str(request_id or ""),
+        str(trace_id or ""),
+        str(brief_id or ""),
+        str(aurora_uid or ""),
+        q,
+        bool(data.get("resolved") is True),
+        normalize_pdp_reason_code(data.get("reason_code")),
+    )
+    return data
 
 async def _photos_api_json(
     method: str,
@@ -2629,6 +2729,7 @@ async def routine_reorder(
                     if isinstance(sku.get("image_url"), str) and sku.get("image_url")
                     else "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
                     "size": str(sku.get("size") or "1 unit"),
+                    "legacy_authoritative": False,
                 }
 
                 # Pass-through scientific + social signals when available.
@@ -2649,6 +2750,37 @@ async def routine_reorder(
                 actives = _extract_kb_actives(step)
                 if actives:
                     product["key_actives"] = actives
+
+                product["legacy_refs"] = {
+                    "sku_id": product_id,
+                    "product_id": sku.get("product_id") or sku.get("productId") or source_sku_id or None,
+                    "merchant_id": sku.get("merchant_id") or sku.get("merchantId") or None,
+                    "product_group_id": sku.get("product_group_id") or sku.get("productGroupId") or None,
+                    "subject": (step.get("subject") if isinstance(step, dict) and isinstance(step.get("subject"), dict) else None)
+                    or (sku.get("subject") if isinstance(sku.get("subject"), dict) else None),
+                    "canonical_product_ref": (
+                        step.get("canonical_product_ref") if isinstance(step, dict) and isinstance(step.get("canonical_product_ref"), dict) else None
+                    )
+                    or (sku.get("canonical_product_ref") if isinstance(sku.get("canonical_product_ref"), dict) else None),
+                    "product_ref": (
+                        step.get("product_ref") if isinstance(step, dict) and isinstance(step.get("product_ref"), dict) else None
+                    )
+                    or (sku.get("product_ref") if isinstance(sku.get("product_ref"), dict) else None),
+                    "authoritative": False,
+                }
+                direct_target = build_direct_pdp_target(
+                    {
+                        "display": {"title": f"{brand} {name}".strip()},
+                        "brand": brand,
+                        "name": name,
+                        "subject": product["legacy_refs"].get("subject"),
+                        "product_group_id": product["legacy_refs"].get("product_group_id"),
+                        "canonical_product_ref": product["legacy_refs"].get("canonical_product_ref"),
+                        "product_ref": product["legacy_refs"].get("product_ref"),
+                    }
+                )
+                if direct_target:
+                    product["pdp_target"] = direct_target
 
                 offer = _build_offer(
                     product_id,
@@ -2935,6 +3067,79 @@ async def offers_resolve(
     # trace_id not used yet; reserved for future audit logs.
     _ = x_trace_id
     return {"items": items}
+
+
+@router.post("/pdp/open-contract")
+async def pdp_open_contract(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+):
+    request_id = str(x_request_id or uuid.uuid4().hex)
+    language_raw = str(body.get("language") or body.get("lang") or "EN").strip().upper()
+    lang_code: Literal["en", "cn"] = "cn" if language_raw in {"CN", "ZH", "ZH-CN", "ZH_HANS"} else "en"
+
+    card_like = body.get("card") if isinstance(body.get("card"), dict) else body.get("item")
+    if not isinstance(card_like, dict):
+        card_like = body
+    product_payload = card_like.get("product") if isinstance(card_like.get("product"), dict) else {}
+    payload = {
+        **(product_payload if isinstance(product_payload, dict) else {}),
+        **{k: v for k, v in card_like.items() if k not in {"product"}},
+    }
+    if not isinstance(payload, dict):
+        payload = {}
+
+    decision = await resolve_pdp_open_contract(
+        payload=payload,
+        language="CN" if lang_code == "cn" else "EN",
+        resolve_once=lambda *, query, hints: _resolve_products_once_for_pdp(
+            query=query,
+            lang=lang_code,
+            hints=hints,
+            brief_id=x_brief_id,
+            trace_id=x_trace_id,
+            aurora_uid=x_aurora_uid,
+            request_id=request_id,
+        ),
+        request_meta={
+            "request_id": request_id,
+            "trace_id": str(x_trace_id or ""),
+            "brief_id": str(x_brief_id or ""),
+            "aurora_uid": str(x_aurora_uid or ""),
+        },
+    )
+
+    reason_code = normalize_pdp_reason_code(decision.get("reason_code"))
+    fallback_reason = normalize_pdp_reason_code(decision.get("fallback_reason_code"))
+    resolve_attempt_count = int(decision.get("resolve_attempt_count") or 0)
+    time_to_pdp_ms = int(decision.get("time_to_pdp_ms") or 0)
+    internal_candidate_found = bool(decision.get("internal_candidate_found"))
+
+    logger.info(
+        "pdp_open_contract request_id=%s trace_id=%s brief_id=%s aurora_uid=%s pdp_open_path=%s fallback_reason_code=%s resolve_attempt_count=%s time_to_pdp_ms=%s internal_candidate_found=%s",
+        request_id,
+        str(x_trace_id or ""),
+        str(x_brief_id or ""),
+        str(x_aurora_uid or ""),
+        str(decision.get("pdp_open_path") or ""),
+        fallback_reason if decision.get("pdp_open_path") == "fallback_external" else "",
+        resolve_attempt_count,
+        time_to_pdp_ms,
+        internal_candidate_found,
+    )
+
+    return {
+        "ok": True,
+        **decision,
+        "reason_code": reason_code,
+        "fallback_reason_code": fallback_reason if decision.get("pdp_open_path") == "fallback_external" else None,
+        "resolve_attempt_count": resolve_attempt_count,
+        "time_to_pdp_ms": time_to_pdp_ms,
+        "internal_candidate_found": internal_candidate_found,
+    }
 
 
 @router.post("/checkout")

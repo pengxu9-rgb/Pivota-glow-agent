@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.main import create_app
+from app.routes import v1 as v1_routes
 
 
 async def _fake_aurora_chat_analysis(**kwargs):
@@ -39,6 +40,31 @@ async def _fake_aurora_chat_chat(**kwargs):
 
 
 class TestChatboxContractEndpoints(unittest.TestCase):
+    def test_qc_harmonize_passed_overrides_pending_advice(self) -> None:
+        qc_status, qc_advice = v1_routes._harmonize_qc_result(
+            qc_status="passed",
+            qc_advice={
+                "summary": "QC is pending.",
+                "suggestions": ["Processing your photo…"],
+                "retryable": False,
+            },
+            tips={"general": ["Clean lens"]},
+        )
+        self.assertEqual(qc_status, "passed")
+        self.assertIsInstance(qc_advice, dict)
+        self.assertIn("passed", str(qc_advice.get("summary") or "").lower())
+        self.assertNotIn("pending", str(qc_advice.get("summary") or "").lower())
+
+    def test_qc_harmonize_pending_has_default_advice(self) -> None:
+        qc_status, qc_advice = v1_routes._harmonize_qc_result(
+            qc_status=None,
+            qc_advice=None,
+            tips=None,
+        )
+        self.assertEqual(qc_status, "pending")
+        self.assertIsInstance(qc_advice, dict)
+        self.assertIn("processing", str(qc_advice.get("summary") or "").lower())
+
     def test_analysis_skin_returns_envelope_and_analysis_meta(self) -> None:
         os.environ["REDIS_URL"] = ""
         app = create_app()

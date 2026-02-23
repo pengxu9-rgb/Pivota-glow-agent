@@ -284,6 +284,70 @@ async def _photos_api_json(
     return data if isinstance(data, dict) else {"data": data}
 
 
+def _is_pending_qc_advice(advice: Any) -> bool:
+    if not isinstance(advice, dict):
+        return False
+    summary = str(advice.get("summary") or "").strip().lower()
+    if "pending" in summary or "processing" in summary:
+        return True
+    suggestions = advice.get("suggestions")
+    if isinstance(suggestions, list):
+        for item in suggestions:
+            text = str(item or "").strip().lower()
+            if "processing" in text or "pending" in text:
+                return True
+    return False
+
+
+def _default_qc_advice(*, qc_status: str, tips: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    tips_obj = tips if isinstance(tips, dict) else {}
+    status = str(qc_status or "pending").strip().lower()
+    if status == "passed":
+        return {
+            "summary": "Photo QC passed.",
+            "suggestions": ["Photo is ready for analysis."],
+            "tips": tips_obj,
+            "retryable": False,
+        }
+    if status == "pending":
+        return {
+            "summary": "Photo is processing.",
+            "suggestions": ["Wait a moment and retry.", "If it keeps failing, try re-uploading in better light."],
+            "tips": tips_obj,
+            "retryable": True,
+        }
+    return {
+        "summary": "Photo quality needs improvement.",
+        "suggestions": [
+            "Retake with stable lighting and avoid backlight.",
+            "Keep your face centered and fully inside the guide frame.",
+        ],
+        "tips": tips_obj,
+        "retryable": True,
+    }
+
+
+def _harmonize_qc_result(
+    *,
+    qc_status: Any,
+    qc_advice: Any,
+    tips: Optional[dict[str, Any]] = None,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    normalized = str(qc_status or "").strip().lower()
+    if normalized not in {"pending", "passed", "degraded", "failed", "too_dark", "has_filter", "blurry"}:
+        normalized = "pending"
+
+    advice_obj = qc_advice if isinstance(qc_advice, dict) else None
+    if normalized == "pending":
+        if advice_obj is None:
+            advice_obj = _default_qc_advice(qc_status=normalized, tips=tips)
+        return normalized, advice_obj
+
+    if advice_obj is None or _is_pending_qc_advice(advice_obj):
+        advice_obj = _default_qc_advice(qc_status=normalized, tips=tips)
+    return normalized, advice_obj
+
+
 async def _upload_photo_via_pivota(
     *,
     blob: bytes,
@@ -341,18 +405,14 @@ async def _upload_photo_via_pivota(
             break
         await asyncio.sleep(0.4)
 
-    if not qc_status:
-        qc_status = "pending"
-    if not qc_advice and qc_status == "pending":
-        tips = presign.get("tips") if isinstance(presign.get("tips"), dict) else {}
-        qc_advice = {
-            "summary": "Photo is processing.",
-            "suggestions": ["Wait a moment and retry.", "If it keeps failing, try re-uploading in better light."],
-            "tips": tips,
-            "retryable": True,
-        }
+    tips = presign.get("tips") if isinstance(presign.get("tips"), dict) else {}
+    normalized_qc_status, normalized_qc_advice = _harmonize_qc_result(
+        qc_status=qc_status,
+        qc_advice=qc_advice,
+        tips=tips,
+    )
 
-    return {"upload_id": upload_id, "qc_status": qc_status, "qc_advice": qc_advice}
+    return {"upload_id": upload_id, "qc_status": normalized_qc_status, "qc_advice": normalized_qc_advice}
 
 
 def _guess_category_from_query(query: str) -> str:
@@ -2755,13 +2815,14 @@ async def photos_qc(
 
     qc_status: str = "pending"
     if isinstance(raw_qc_status, str) and raw_qc_status.strip():
-        normalized = raw_qc_status.strip()
-        if normalized in {"passed", "too_dark", "has_filter", "blurry"}:
+        normalized = raw_qc_status.strip().lower()
+        if normalized in {"pending", "passed", "degraded", "failed", "too_dark", "has_filter", "blurry"}:
             qc_status = normalized
 
     qc_advice: Optional[dict[str, Any]] = None
     if isinstance(result.get("qc"), dict) and isinstance(result["qc"].get("advice"), dict):
         qc_advice = result["qc"]["advice"]
+    qc_status, qc_advice = _harmonize_qc_result(qc_status=qc_status, qc_advice=qc_advice, tips=None)
 
     try:
         stored = await SESSION_STORE.get(brief_id)

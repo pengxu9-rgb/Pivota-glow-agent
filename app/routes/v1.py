@@ -1756,6 +1756,51 @@ def _extract_safety_flags(diagnosis_payload: Any, body: Any, stored: dict[str, A
     return deduped[:6]
 
 
+def _sanitize_chat_answer(answer: Optional[str]) -> Optional[str]:
+    if not isinstance(answer, str):
+        return answer
+    text = answer.strip()
+    if not text:
+        return text
+
+    forbidden_prefixes = (
+        "skin_type=",
+        "barrier_status=",
+        "current_regimen=",
+        "user message:",
+        "user question:",
+        "important: reply only",
+        "recent_checkins:",
+        "itinerary_context=",
+        "current_products=",
+        "photos_provided=",
+        "photo_qc=",
+        "language:",
+    )
+
+    lines = text.splitlines()
+    cleaned: list[str] = []
+    skip_recent_log_rows = False
+    for raw in lines:
+        line = raw.strip()
+        lower = line.lower()
+
+        if any(lower.startswith(prefix) for prefix in forbidden_prefixes):
+            if lower.startswith("recent_checkins:"):
+                skip_recent_log_rows = True
+            continue
+
+        if skip_recent_log_rows:
+            if line.startswith("-") and ("redness=" in lower or "acne=" in lower or "hydration=" in lower):
+                continue
+            skip_recent_log_rows = False
+
+        cleaned.append(raw)
+
+    merged = "\n".join(cleaned).strip()
+    return merged if merged else text
+
+
 def _mock_auth_session_payload(email: str) -> dict[str, Any]:
     exp = datetime.now(timezone.utc) + timedelta(days=30)
     clean_email = (email or "").strip() or "user@pivota.local"
@@ -4370,6 +4415,8 @@ async def chat(
             answer = "为了给你更准确的建议，我需要先确认一个信息："
         else:
             answer = "One quick question so I can answer accurately:"
+    elif isinstance(answer, str):
+        answer = _sanitize_chat_answer(answer)
 
     await SESSION_STORE.upsert(
         brief_id,

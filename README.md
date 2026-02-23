@@ -5,15 +5,20 @@ FastAPI orchestrator for the `pivota-glow-guide` frontend.
 This service exposes a stable API surface for the frontend:
 
 - `GET /v1/session/bootstrap`
+- `POST /v1/profile/update` (chatbox-compatible alias)
 - `POST /v1/diagnosis`
 - `POST /v1/photos` (multipart)
+- `POST /v1/photos/upload` (chatbox-compatible single-slot upload)
 - `GET /v1/photos/qc?upload_id=...` (poll QC for pending uploads)
 - `POST /v1/photos/sample`
 - `POST /v1/events` (client analytics ingest; optional PostHog forward)
 - `POST /v1/analysis`
+- `POST /v1/analysis/skin` (chatbox-compatible alias)
 - `POST /v1/analysis/risk`
+- `POST /v1/tracker/log` (check-in + recommendation refresh hint)
 - `POST /v1/routine/reorder`
 - `PATCH /v1/routine/selection`
+- `POST /v1/chat` (now returns envelope-compatible fields in addition to legacy keys)
 - `POST /v1/checkout`
 - `POST /v1/affiliate/outcome`
 

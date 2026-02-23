@@ -1590,6 +1590,172 @@ def _require_brief_id(x_brief_id: Optional[str]) -> str:
     return x_brief_id
 
 
+def _coerce_trace_id(raw: Optional[str]) -> str:
+    trace = str(raw or "").strip()
+    if trace:
+        return trace[:128]
+    return f"trace_{uuid.uuid4().hex}"
+
+
+def _new_request_id() -> str:
+    return f"req_{uuid.uuid4().hex}"
+
+
+def _make_card(card_type: str, payload: dict[str, Any], *, title: Optional[str] = None) -> dict[str, Any]:
+    card: dict[str, Any] = {
+        "card_id": f"{card_type}_{uuid.uuid4().hex[:10]}",
+        "type": card_type,
+        "payload": payload,
+    }
+    if isinstance(title, str) and title.strip():
+        card["title"] = title.strip()[:120]
+    return card
+
+
+def _build_envelope(
+    *,
+    trace_id: str,
+    assistant_text: Optional[str] = None,
+    cards: Optional[list[dict[str, Any]]] = None,
+    suggested_chips: Optional[list[dict[str, Any]]] = None,
+    session_patch: Optional[dict[str, Any]] = None,
+    events: Optional[list[dict[str, Any]]] = None,
+    analysis_meta: Optional[dict[str, Any]] = None,
+    recommendation_meta: Optional[dict[str, Any]] = None,
+    reco_refresh_hint: Optional[dict[str, Any]] = None,
+    meta: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    env: dict[str, Any] = {
+        "request_id": _new_request_id(),
+        "trace_id": trace_id,
+        "assistant_message": {"role": "assistant", "content": assistant_text, "format": "text"} if assistant_text else None,
+        "suggested_chips": suggested_chips or [],
+        "cards": cards or [],
+        "session_patch": session_patch or {},
+        "events": events or [],
+        "meta": meta or {},
+    }
+    if isinstance(analysis_meta, dict):
+        env["analysis_meta"] = analysis_meta
+    if isinstance(recommendation_meta, dict):
+        env["recommendation_meta"] = recommendation_meta
+    if isinstance(reco_refresh_hint, dict):
+        env["reco_refresh_hint"] = reco_refresh_hint
+    return env
+
+
+def _clarification_to_chips(clarification: Any) -> list[dict[str, Any]]:
+    if not isinstance(clarification, dict):
+        return []
+    questions = clarification.get("questions")
+    if not isinstance(questions, list):
+        return []
+    chips: list[dict[str, Any]] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("id") or "clarify").strip().lower() or "clarify"
+        options = q.get("options")
+        if not isinstance(options, list):
+            continue
+        for idx, option in enumerate(options):
+            label = str(option).strip()
+            if not label:
+                continue
+            chips.append(
+                {
+                    "chip_id": f"chip.clarify.{qid}.{idx + 1}",
+                    "label": label[:80],
+                    "kind": "quick_reply",
+                    "data": {"reply_text": label[:300]},
+                }
+            )
+            if len(chips) >= 6:
+                return chips
+    return chips
+
+
+def _coerce_checkin_score(value: Any) -> int:
+    try:
+        score = int(value)
+    except Exception:
+        return 0
+    return max(0, min(5, score))
+
+
+def _compute_checkin_trend(prev: Optional[dict[str, Any]], curr: dict[str, Any]) -> str:
+    if not isinstance(prev, dict):
+        return "checkin_logged"
+
+    prev_red = _coerce_checkin_score(prev.get("redness"))
+    prev_acne = _coerce_checkin_score(prev.get("acne"))
+    prev_hyd = _coerce_checkin_score(prev.get("hydration"))
+    cur_red = _coerce_checkin_score(curr.get("redness"))
+    cur_acne = _coerce_checkin_score(curr.get("acne"))
+    cur_hyd = _coerce_checkin_score(curr.get("hydration"))
+
+    worsen = max(0, cur_red - prev_red) + max(0, cur_acne - prev_acne) + max(0, prev_hyd - cur_hyd)
+    improve = max(0, prev_red - cur_red) + max(0, prev_acne - cur_acne) + max(0, cur_hyd - prev_hyd)
+
+    if worsen >= 2 and worsen > improve:
+        return "checkin_worse"
+    if improve >= 2 and improve > worsen:
+        return "checkin_improved"
+    return "checkin_volatile"
+
+
+def _format_recent_logs_for_prompt(raw_logs: Any) -> tuple[str, bool]:
+    if not isinstance(raw_logs, list):
+        return ("", False)
+    rows: list[str] = []
+    for item in raw_logs[-3:]:
+        if not isinstance(item, dict):
+            continue
+        ts = str(item.get("logged_at") or item.get("timestamp") or "").strip()
+        red = _coerce_checkin_score(item.get("redness"))
+        acne = _coerce_checkin_score(item.get("acne"))
+        hyd = _coerce_checkin_score(item.get("hydration"))
+        note = str(item.get("notes") or "").strip()
+        row = f"{ts or 'recent'} redness={red}/5 acne={acne}/5 hydration={hyd}/5"
+        if note:
+            row += f" note={note[:120]}"
+        rows.append(row)
+    if not rows:
+        return ("", False)
+    return ("recent_checkins:\n- " + "\n- ".join(rows), True)
+
+
+def _extract_itinerary(payload: Any, stored: dict[str, Any]) -> Optional[str]:
+    if isinstance(payload, dict):
+        itinerary = payload.get("itinerary")
+        if isinstance(itinerary, str) and itinerary.strip():
+            return itinerary.strip()[:500]
+    stored_itinerary = stored.get("itinerary")
+    if isinstance(stored_itinerary, str) and stored_itinerary.strip():
+        return stored_itinerary.strip()[:500]
+    return None
+
+
+def _extract_safety_flags(diagnosis_payload: Any, body: Any, stored: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    candidate_sources = [diagnosis_payload, body.get("profile") if isinstance(body, dict) else None, stored.get("profile")]
+    for source in candidate_sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("pregnancy") in {True, "true", "yes", "1"}:
+            flags.append("pregnancy")
+        if source.get("lactation") in {True, "true", "yes", "1"}:
+            flags.append("lactation")
+        meds = source.get("high_risk_medications") or source.get("risk_medications")
+        if meds:
+            flags.append("high_risk_medications")
+    deduped: list[str] = []
+    for f in flags:
+        if f not in deduped:
+            deduped.append(f)
+    return deduped[:6]
+
+
 def _truncate_event_payload(value: Any, limit: int = 2000) -> Any:
     try:
         text = str(value)
@@ -1756,6 +1922,84 @@ async def ingest_events(
             asyncio.create_task(_write_events_jsonl_sink(rows=rows_to_forward))
 
     return {"ok": True, "accepted": accepted}
+
+
+@router.post("/tracker/log")
+async def tracker_log(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+    x_aurora_lang: Optional[str] = Header(default=None, alias="X-Aurora-Lang"),
+):
+    brief_id = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    lang_code = _normalize_lang(x_aurora_lang)
+
+    now_dt = datetime.now(timezone.utc)
+    entry = {
+        "logged_at": now_dt.isoformat(),
+        "redness": _coerce_checkin_score(body.get("redness")),
+        "acne": _coerce_checkin_score(body.get("acne")),
+        "hydration": _coerce_checkin_score(body.get("hydration")),
+        "notes": str(body.get("notes") or "").strip()[:400] if body.get("notes") is not None else "",
+    }
+
+    stored = await SESSION_STORE.get(brief_id)
+    existing_logs = stored.get("recent_logs") if isinstance(stored.get("recent_logs"), list) else []
+    logs = [x for x in existing_logs if isinstance(x, dict)]
+    prev = logs[-1] if logs else None
+    logs = [*logs, entry][-30:]
+
+    reason = _compute_checkin_trend(prev, entry)
+    reco_refresh_hint = {
+        "should_refresh": True,
+        "reason": reason,
+        "effective_window_days": 14,
+    }
+
+    await SESSION_STORE.upsert(
+        brief_id,
+        {
+            "trace_id": trace_id,
+            "recent_logs": logs,
+            "last_checkin_at": now_dt.isoformat(),
+            "checkin_due": False,
+        },
+    )
+
+    uid = (x_aurora_uid or "").strip()
+    if uid:
+        try:
+            await PERSISTENT_SESSION_STORE.patch(
+                uid,
+                SessionDataPatch(
+                    last_checkin_at=now_dt,
+                    last_seen_at=now_dt,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("persistent_checkin_patch_failed err=%s", getattr(exc, "message", str(exc)))
+
+    session_patch = {
+        "recent_logs": logs[-5:],
+        "checkin_due": False,
+    }
+    assistant_text = "Check-in saved. I can refresh recommendations now." if lang_code == "en" else "打卡已保存。现在可以基于最新记录刷新推荐。"
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text=assistant_text,
+        cards=[],
+        session_patch=session_patch,
+        events=[{"name": "tracker_log_saved", "reason": reason}],
+        reco_refresh_hint=reco_refresh_hint,
+    )
+
+    return {
+        **envelope,
+        "ok": True,
+        "reco_refresh_hint": reco_refresh_hint,
+    }
 
 
 class SessionBootstrapSummary(BaseModel):
@@ -1941,17 +2185,20 @@ def _extract_sensitivities(session: SessionData) -> list[str]:
     return deduped
 
 
-@router.get("/session/bootstrap", response_model=SessionBootstrapResponse)
+@router.get("/session/bootstrap")
 async def session_bootstrap(
     brief_id: Optional[str] = None,
     session_id: Optional[str] = None,
     x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
     x_aurora_lang: Optional[str] = Header(default=None, alias="X-Aurora-Lang"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     _ = (brief_id, session_id)  # Reserved for future compatibility.
 
     uid = (x_aurora_uid or "").strip()
     lang = _normalize_lang(x_aurora_lang)
+    trace_id = _coerce_trace_id(x_trace_id)
+    recent_logs: list[dict[str, Any]] = []
 
     response = SessionBootstrapResponse(
         is_returning=False,
@@ -1960,11 +2207,37 @@ async def session_bootstrap(
     )
 
     if not uid:
-        return response
+        bootstrap_payload = {
+            "profile": None,
+            "recent_logs": recent_logs,
+            "checkin_due": response.summary.checkin_due,
+            "is_returning": response.is_returning,
+            "db_ready": True,
+        }
+        envelope = _build_envelope(
+            trace_id=trace_id,
+            cards=[_make_card("session_bootstrap", bootstrap_payload)],
+            session_patch=bootstrap_payload,
+            events=[{"name": "session_bootstrap", "is_returning": False}],
+        )
+        return {**response.model_dump(mode="json"), **envelope}
 
     session = await PERSISTENT_SESSION_STORE.get(uid)
     if not session:
-        return response
+        bootstrap_payload = {
+            "profile": None,
+            "recent_logs": recent_logs,
+            "checkin_due": response.summary.checkin_due,
+            "is_returning": response.is_returning,
+            "db_ready": True,
+        }
+        envelope = _build_envelope(
+            trace_id=trace_id,
+            cards=[_make_card("session_bootstrap", bootstrap_payload)],
+            session_patch=bootstrap_payload,
+            events=[{"name": "session_bootstrap", "is_returning": False}],
+        )
+        return {**response.model_dump(mode="json"), **envelope}
 
     now_dt = datetime.now(timezone.utc)
 
@@ -2010,7 +2283,31 @@ async def session_bootstrap(
     response.is_returning = True
     response.summary = summary
     response.artifacts_present = artifacts_present
-    return response
+
+    # Optional: attach short recent logs from active brief session when available.
+    if isinstance(brief_id, str) and brief_id.strip():
+        try:
+            volatile_session = await SESSION_STORE.get(brief_id.strip())
+            raw_logs = volatile_session.get("recent_logs")
+            if isinstance(raw_logs, list):
+                recent_logs = [x for x in raw_logs if isinstance(x, dict)][-5:]
+        except Exception:
+            recent_logs = []
+
+    bootstrap_payload = {
+        "profile": session.profile if isinstance(session.profile, dict) else None,
+        "recent_logs": recent_logs,
+        "checkin_due": summary.checkin_due,
+        "is_returning": True,
+        "db_ready": True,
+    }
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("session_bootstrap", bootstrap_payload)],
+        session_patch=bootstrap_payload,
+        events=[{"name": "session_bootstrap", "is_returning": True}],
+    )
+    return {**response.model_dump(mode="json"), **envelope}
 
 
 @router.post("/session/profile/patch", response_model=SessionProfilePatchResponse)
@@ -2029,6 +2326,71 @@ async def session_profile_patch(
         SessionDataPatch(profile=profile_patch, last_seen_at=now_dt),
     )
     return SessionProfilePatchResponse(ok=True, session=session)
+
+
+@router.post("/profile/update")
+async def profile_update(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+    x_aurora_uid: Optional[str] = Header(default=None, alias="X-Aurora-Uid"),
+):
+    brief_id = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+
+    profile_patch_raw = body.get("profile") if isinstance(body.get("profile"), dict) else body
+    profile_patch = profile_patch_raw if isinstance(profile_patch_raw, dict) else {}
+    profile_patch = {k: v for k, v in profile_patch.items() if v is not None}
+
+    diagnosis_payload: dict[str, Any] = {
+        "skinType": profile_patch.get("skinType") or profile_patch.get("skin_type"),
+        "concerns": profile_patch.get("concerns") if isinstance(profile_patch.get("concerns"), list) else [],
+        "currentRoutine": profile_patch.get("currentRoutine")
+        or profile_patch.get("current_routine")
+        or profile_patch.get("routine")
+        or "basic",
+        "barrierStatus": profile_patch.get("barrierStatus")
+        or profile_patch.get("barrier_status")
+        or profile_patch.get("barrier")
+        or "unknown",
+    }
+
+    patch_payload: dict[str, Any] = {"profile": profile_patch}
+    if diagnosis_payload.get("skinType") or diagnosis_payload.get("concerns"):
+        patch_payload["diagnosis"] = diagnosis_payload
+
+    updated = await SESSION_STORE.upsert(
+        brief_id,
+        {
+            "trace_id": trace_id,
+            **patch_payload,
+        },
+    )
+
+    uid = (x_aurora_uid or "").strip()
+    if uid:
+        now_dt = datetime.now(timezone.utc)
+        persistent_patch = SessionDataPatch(profile=profile_patch, last_seen_at=now_dt)
+        if diagnosis_payload.get("concerns"):
+            persistent_patch.goals = diagnosis_payload.get("concerns")
+        try:
+            await PERSISTENT_SESSION_STORE.patch(uid, persistent_patch)
+        except Exception as exc:
+            logger.warning("persistent_profile_update_failed err=%s", getattr(exc, "message", str(exc)))
+
+    session_patch = {"profile": profile_patch}
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("profile_updated", {"profile": profile_patch})],
+        session_patch=session_patch,
+        events=[{"name": "profile_updated"}],
+    )
+
+    return {
+        **envelope,
+        "ok": True,
+        "session": {"profile": updated.get("profile") if isinstance(updated, dict) else profile_patch},
+    }
 
 
 @router.post("/diagnosis")
@@ -2201,6 +2563,101 @@ async def photos_upload(
     return {"session": patch, "next_state": patch["next_state"]}
 
 
+@router.post("/photos/upload")
+async def photos_upload_single(
+    slot_id: str = Form(...),
+    consent: Optional[bool] = Form(default=None),
+    photo: UploadFile = File(...),
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    brief_id = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+
+    slot_raw = str(slot_id or "").strip().lower()
+    slot_map = {
+        "daylight": "daylight",
+        "indoor_white": "indoor_white",
+        "indoor-white": "indoor_white",
+        "indoor": "indoor_white",
+    }
+    slot = slot_map.get(slot_raw)
+    if not slot:
+        raise HTTPException(status_code=400, detail="Invalid slot_id")
+
+    if consent is not True:
+        raise HTTPException(status_code=400, detail="Missing consent for photo upload")
+
+    blob = await photo.read()
+    if not blob:
+        raise HTTPException(status_code=400, detail="Missing photo content")
+
+    result = await _upload_photo_via_pivota(
+        blob=blob,
+        content_type=(photo.content_type or "image/jpeg").strip() or "image/jpeg",
+        file_name=photo.filename,
+        user_id=brief_id,
+        consent=bool(consent),
+    )
+
+    stored = await SESSION_STORE.get(brief_id)
+    photos = stored.get("photos") if isinstance(stored.get("photos"), dict) else {}
+    current_slot = photos.get(slot) if isinstance(photos, dict) else {}
+    retry_count = 0
+    if isinstance(current_slot, dict):
+        try:
+            retry_count = int(current_slot.get("retry_count") or 0)
+        except Exception:
+            retry_count = 0
+        if current_slot.get("upload_id"):
+            retry_count += 1
+
+    slot_patch: dict[str, Any] = {
+        "upload_id": result.get("upload_id"),
+        "qc_status": str(result.get("qc_status") or "pending"),
+        "retry_count": max(0, retry_count),
+    }
+    if isinstance(result.get("qc_advice"), dict):
+        slot_patch["qc_advice"] = result.get("qc_advice")
+
+    merged_photos = dict(photos) if isinstance(photos, dict) else {}
+    merged_photos[slot] = slot_patch
+
+    next_state = "S4_ANALYSIS_LOADING" if slot_patch["qc_status"] == "passed" else "S3a_PHOTO_QC"
+    await SESSION_STORE.upsert(
+        brief_id,
+        {
+            "trace_id": trace_id,
+            "state": next_state,
+            "photos": merged_photos,
+        },
+    )
+
+    card_payload: dict[str, Any] = {
+        "slot_id": slot,
+        "photo_id": slot_patch.get("upload_id"),
+        "qc_status": slot_patch.get("qc_status"),
+    }
+    if isinstance(slot_patch.get("qc_advice"), dict):
+        card_payload["qc_advice"] = slot_patch["qc_advice"]
+
+    session_patch = {"photos": {slot: slot_patch}, "next_state": next_state}
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("photo_confirm", card_payload)],
+        session_patch=session_patch,
+        events=[{"name": "photo_uploaded", "slot_id": slot, "qc_status": slot_patch.get("qc_status")}],
+    )
+
+    return {
+        **envelope,
+        "session": session_patch,
+        "next_state": next_state,
+        "upload_id": slot_patch.get("upload_id"),
+        "qc_status": slot_patch.get("qc_status"),
+    }
+
+
 @router.get("/photos/qc")
 async def photos_qc(
     upload_id: str,
@@ -2319,6 +2776,7 @@ async def analysis(
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     brief_id = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
     stored = await SESSION_STORE.get(brief_id)
 
     diagnosis_payload = stored.get("diagnosis") if isinstance(stored.get("diagnosis"), dict) else None
@@ -2359,6 +2817,8 @@ async def analysis(
 
     aurora_context: Optional[dict[str, Any]] = None
     aurora_answer: Optional[str] = None
+    llm_report_called = False
+    degrade_reason: Optional[str] = None
     try:
         profile_line = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
         photo_line = f"photos_provided={'yes' if photos_provided else 'no'}; photo_qc={', '.join(photo_qc_parts) if photo_qc_parts else 'none'}."
@@ -2391,23 +2851,32 @@ async def analysis(
             query=prompt,
             timeout_s=DEFAULT_TIMEOUT_S,
         )
+        llm_report_called = True
         aurora_ctx_raw = aurora_payload.get("context") if isinstance(aurora_payload, dict) else None
         aurora_context = aurora_ctx_raw if isinstance(aurora_ctx_raw, dict) else None
         if isinstance(aurora_payload.get("answer"), str):
             aurora_answer = aurora_payload.get("answer")
     except Exception as exc:
         logger.warning("Aurora analysis call failed; falling back. err=%s", exc)
+        degrade_reason = "aurora_call_failed"
 
     analysis_result: dict[str, Any]
     parsed = extract_json_object(aurora_answer or "")
     normalized = _normalize_analysis_from_llm(parsed)
+    artifact_usable = False
     if normalized:
         if _analysis_violates_guardrails(analysis_obj=normalized, photos_provided=photos_provided):
             logger.warning("LLM analysis violated guardrails; using rule-based fallback.")
+            degrade_reason = "guardrail_violation"
             analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
         else:
             analysis_result = normalized
+            artifact_usable = True
     else:
+        if llm_report_called:
+            degrade_reason = degrade_reason or "llm_parse_failed"
+        else:
+            degrade_reason = degrade_reason or "llm_skipped"
         analysis_result = _analysis_from_aurora_context(diagnosis_payload, aurora_context)
 
     if lang_code == "EN" and _analysis_contains_cjk(analysis_result):
@@ -2432,13 +2901,54 @@ async def analysis(
     await SESSION_STORE.upsert(
         brief_id,
         {
-            "trace_id": x_trace_id,
+            "trace_id": trace_id,
             "state": patch["next_state"],
             "analysis": analysis_result,
             "aurora_context": aurora_context,
         },
     )
-    return {"session": patch, "next_state": patch["next_state"], "analysis": analysis_result}
+
+    analysis_meta = {
+        "detector_source": "self_report_rule" if not photos_provided else "aurora_photo_context",
+        "llm_vision_called": False,
+        "llm_report_called": llm_report_called,
+        "artifact_usable": artifact_usable,
+        "degrade_reason": degrade_reason,
+    }
+    analysis_card_payload = {
+        "features": analysis_result.get("features") if isinstance(analysis_result.get("features"), list) else [],
+        "strategy": str(analysis_result.get("strategy") or ""),
+        "needs_risk_check": bool(analysis_result.get("needs_risk_check")),
+    }
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("analysis_summary", analysis_card_payload)],
+        session_patch=patch,
+        events=[
+            {
+                "name": "analysis_completed",
+                "photos_provided": photos_provided,
+                "artifact_usable": artifact_usable,
+            }
+        ],
+        analysis_meta=analysis_meta,
+    )
+    return {
+        **envelope,
+        "session": patch,
+        "next_state": patch["next_state"],
+        "analysis": analysis_result,
+        "analysis_meta": analysis_meta,
+    }
+
+
+@router.post("/analysis/skin")
+async def analysis_skin(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    return await analysis(body=body, x_brief_id=x_brief_id, x_trace_id=x_trace_id)
 
 
 @router.post("/analysis/risk")
@@ -3188,6 +3698,7 @@ async def chat(
     x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
 ):
     brief_id = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
     stored = await SESSION_STORE.get(brief_id)
 
     message = body.get("message") or body.get("query")
@@ -3212,6 +3723,20 @@ async def chat(
     pending_request_kind = stored.get("pending_request_kind") if isinstance(stored.get("pending_request_kind"), str) else None
     pending_profile_field = stored.get("pending_profile_field") if isinstance(stored.get("pending_profile_field"), str) else None
     current_products_text = stored.get("current_products_text") if isinstance(stored.get("current_products_text"), str) else None
+    recent_logs_block, used_recent_logs = _format_recent_logs_for_prompt(stored.get("recent_logs"))
+    itinerary_text = _extract_itinerary(body, stored)
+    used_itinerary = isinstance(itinerary_text, str) and bool(itinerary_text.strip())
+    safety_flags = _extract_safety_flags(diagnosis_payload, body, stored)
+    used_safety_flags = bool(safety_flags)
+
+    context_lines: list[str] = []
+    if used_recent_logs and recent_logs_block:
+        context_lines.append(recent_logs_block)
+    if used_itinerary and itinerary_text:
+        context_lines.append(f"itinerary_context={itinerary_text}")
+    if used_safety_flags and safety_flags:
+        context_lines.append("safety_flags=" + ", ".join(safety_flags))
+    context_block = ("\n" + "\n".join(context_lines) + "\n") if context_lines else "\n"
 
     sys_prompt = f"{GLOW_SYSTEM_PROMPT}\n\n" if GLOW_SYSTEM_PROMPT else ""
     reply_instruction = (
@@ -3225,16 +3750,52 @@ async def chat(
     effective_message = message.strip()
     products_review_mode = False
 
+    def _pack_chat_response(
+        *,
+        answer_text: Optional[str],
+        intent_value: Any,
+        clarification_value: Any = None,
+        context_value: Any = None,
+    ) -> dict[str, Any]:
+        intent_str = str(intent_value or "").strip() or "answer"
+        source_mode: Literal["artifact_matcher", "upstream_fallback", "rules_only"] = "upstream_fallback"
+        if intent_str in {"clarify", "explain"}:
+            source_mode = "rules_only"
+        recommendation_meta = {
+            "source_mode": source_mode,
+            "used_recent_logs": used_recent_logs,
+            "used_itinerary": used_itinerary,
+            "used_safety_flags": used_safety_flags,
+        }
+        chips = _clarification_to_chips(clarification_value) if intent_str == "clarify" else []
+        envelope = _build_envelope(
+            trace_id=trace_id,
+            assistant_text=answer_text if isinstance(answer_text, str) else None,
+            suggested_chips=chips,
+            cards=[],
+            session_patch={},
+            events=[{"name": "chat_response", "intent": intent_str}],
+            recommendation_meta=recommendation_meta,
+        )
+        return {
+            **envelope,
+            "answer": answer_text,
+            "intent": intent_value,
+            "clarification": clarification_value,
+            "context": context_value,
+            "recommendation_meta": recommendation_meta,
+        }
+
     def _clarify_skin_type() -> dict[str, Any]:
         question = "Which skin type fits you best?" if lang_code == "EN" else "你的肤质更接近哪一种？"
         options = ["Oily", "Dry", "Combination", "Sensitive", "Not sure"] if lang_code == "EN" else ["油皮", "干皮", "混合皮", "敏感肌", "不确定"]
         answer = "One quick question so I can answer accurately:" if lang_code == "EN" else "为了给你更准确的建议，我需要先确认一项信息："
-        return {
-            "answer": answer,
-            "intent": "clarify",
-            "clarification": {"questions": [{"id": "skin_type", "question": question, "options": options}], "missing_fields": ["skinType"]},
-            "context": None,
-        }
+        return _pack_chat_response(
+            answer_text=answer,
+            intent_value="clarify",
+            clarification_value={"questions": [{"id": "skin_type", "question": question, "options": options}], "missing_fields": ["skinType"]},
+            context_value=None,
+        )
 
     def _clarify_barrier() -> dict[str, Any]:
         question = (
@@ -3244,12 +3805,12 @@ async def chat(
         )
         options = ["No", "Mild", "Yes (stinging/redness)", "Not sure"] if lang_code == "EN" else ["没有", "轻微", "有（刺痛/泛红）", "不确定"]
         answer = "One quick question so I can answer accurately:" if lang_code == "EN" else "为了给你更准确的建议，我需要再确认一项信息："
-        return {
-            "answer": answer,
-            "intent": "clarify",
-            "clarification": {"questions": [{"id": "barrier_status", "question": question, "options": options}], "missing_fields": ["barrierStatus"]},
-            "context": None,
-        }
+        return _pack_chat_response(
+            answer_text=answer,
+            intent_value="clarify",
+            clarification_value={"questions": [{"id": "barrier_status", "question": question, "options": options}], "missing_fields": ["barrierStatus"]},
+            context_value=None,
+        )
 
     # If we captured a routine list first, we may need to collect minimal skin profile
     # before we can safely review/compare products.
@@ -3413,17 +3974,18 @@ async def chat(
             options = ["None / start fresh"]
             answer = "One quick question so I can answer accurately:"
 
-        return {
-            "answer": answer,
-            "intent": "clarify",
-            "clarification": {"questions": [{"id": "current_products", "question": question, "options": options}], "missing_fields": ["current_products"]},
-            "context": None,
-        }
+        return _pack_chat_response(
+            answer_text=answer,
+            intent_value="clarify",
+            clarification_value={"questions": [{"id": "current_products", "question": question, "options": options}], "missing_fields": ["current_products"]},
+            context_value=None,
+        )
 
     if isinstance(anchor_product_id, str) and anchor_product_id.strip():
         profile = _aurora_profile_sentence(diagnosis=diagnosis_payload, market=market, budget=budget, language=lang_code)
         query = (
             f"{sys_prompt}{profile}\n"
+            f"{context_block}"
             f"User question: {effective_message}\n"
             "Please give a detailed product-fit assessment (suitability, risks/cautions, how to use, and 1–2 alternatives).\n"
             f"{reply_instruction}"
@@ -3432,12 +3994,12 @@ async def chat(
         if _looks_like_reco_rationale_request(effective_message) and isinstance(stored.get("aurora_context"), dict):
             explained = _explain_routine_from_aurora_context(stored["aurora_context"], language=lang_code)
             if explained:
-                return {
-                    "answer": explained,
-                    "intent": "explain",
-                    "clarification": None,
-                    "context": stored.get("aurora_context"),
-                }
+                return _pack_chat_response(
+                    answer_text=explained,
+                    intent_value="explain",
+                    clarification_value=None,
+                    context_value=stored.get("aurora_context"),
+                )
 
         if current_products_text and (_looks_like_current_products_review_request(effective_message) or _looks_like_routine_request(effective_message)):
             products_review_mode = True
@@ -3455,11 +4017,17 @@ async def chat(
                 else "请基于我的情况给一套简单的早晚护肤 routine（尽量温和、步骤少），并尽量复用 current_products。\n"
                      "如果必须补 1 个关键信息（比如目标/预算），请先只问 1 个非常简短的问题。"
             )
-            query = f"{sys_prompt}{profile}\ncurrent_products={current_products_text}\nUser request: {routine_request}\n{reply_instruction}"
+            query = (
+                f"{sys_prompt}{profile}\n"
+                f"current_products={current_products_text}\n"
+                f"{context_block}"
+                f"User request: {routine_request}\n"
+                f"{reply_instruction}"
+            )
         else:
             profile = _aurora_profile_line(diagnosis=diagnosis_payload, market=market, budget=budget)
             products_block = f"\ncurrent_products={current_products_text}\n" if current_products_text else ""
-            query = f"{sys_prompt}{profile}{products_block}\nUser message: {effective_message}\n{reply_instruction}"
+            query = f"{sys_prompt}{profile}{products_block}{context_block}User message: {effective_message}\n{reply_instruction}"
 
     try:
         payload = await aurora_chat(
@@ -3517,7 +4085,7 @@ async def chat(
     await SESSION_STORE.upsert(
         brief_id,
         {
-            "trace_id": x_trace_id,
+            "trace_id": trace_id,
             "last_user_message": effective_message[:2000],
             "last_aurora_intent": intent,
             "last_aurora_answer": answer,
@@ -3525,9 +4093,9 @@ async def chat(
         },
     )
 
-    return {
-        "answer": answer,
-        "intent": intent,
-        "clarification": clarification,
-        "context": context,
-    }
+    return _pack_chat_response(
+        answer_text=answer if isinstance(answer, str) else None,
+        intent_value=intent,
+        clarification_value=clarification,
+        context_value=context,
+    )

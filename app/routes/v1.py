@@ -4375,7 +4375,18 @@ async def chat(
         )
     except Exception as exc:
         logger.error("Aurora chat failed. err=%s", exc)
-        raise HTTPException(status_code=502, detail={"upstream": "aurora", "error": str(exc)}) from exc
+        fallback_answer = (
+            "I hit a temporary upstream issue. I can still refresh a conservative recommendation using your profile and recent check-ins. "
+            "Please retry in a few seconds for full model-backed details."
+            if lang_code == "EN"
+            else "上游模型暂时不可用。我可以先基于你的画像和最近打卡给出保守建议；请稍后重试以获取完整模型分析。"
+        )
+        return _pack_chat_response(
+            answer_text=fallback_answer,
+            intent_value="fallback",
+            clarification_value=None,
+            context_value={"upstream": "aurora", "degraded": True},
+        )
 
     answer = payload.get("answer") if isinstance(payload, dict) else None
     intent = payload.get("intent") if isinstance(payload, dict) else None

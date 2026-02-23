@@ -1759,7 +1759,8 @@ def _extract_safety_flags(diagnosis_payload: Any, body: Any, stored: dict[str, A
 def _sanitize_chat_answer(answer: Optional[str]) -> Optional[str]:
     if not isinstance(answer, str):
         return answer
-    text = answer.strip()
+    # Remove non-printable control chars that can break downstream parsers.
+    text = "".join(ch for ch in answer if (ord(ch) >= 32 or ch in "\n\t\r")).strip()
     if not text:
         return text
 

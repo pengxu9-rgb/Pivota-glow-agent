@@ -6,6 +6,7 @@ This service exposes a stable API surface for the frontend:
 
 - `GET /v1/session/bootstrap`
 - `POST /v1/profile/update` (chatbox-compatible alias)
+- `POST /v1/auth/start` / `POST /v1/auth/verify` / `POST /v1/auth/password/login` / `POST /v1/auth/password/set` / `POST /v1/auth/logout` (chatbox compatibility surface)
 - `POST /v1/diagnosis`
 - `POST /v1/photos` (multipart)
 - `POST /v1/photos/upload` (chatbox-compatible single-slot upload)
@@ -19,6 +20,8 @@ This service exposes a stable API surface for the frontend:
 - `POST /v1/routine/reorder`
 - `PATCH /v1/routine/selection`
 - `POST /v1/chat` (now returns envelope-compatible fields in addition to legacy keys)
+- `POST /v1/product/parse` / `POST /v1/product/analyze` (chatbox-compatible product deep scan surface)
+- `POST /v1/dupe/suggest` / `POST /v1/dupe/compare` (chatbox-compatible dupe exploration surface)
 - `POST /v1/checkout`
 - `POST /v1/affiliate/outcome`
 

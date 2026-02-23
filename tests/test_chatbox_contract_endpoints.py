@@ -131,3 +131,57 @@ class TestChatboxContractEndpoints(unittest.TestCase):
         self.assertTrue(reco_meta.get("used_itinerary"))
         self.assertIn("used_safety_flags", reco_meta)
 
+    def test_auth_verify_returns_auth_session_card(self) -> None:
+        os.environ["REDIS_URL"] = ""
+        app = create_app()
+        brief_id = f"brief_{uuid.uuid4().hex}"
+
+        with TestClient(app) as client:
+            res = client.post(
+                "/v1/auth/verify",
+                headers={"X-Brief-ID": brief_id},
+                json={"email": "test@example.com", "code": "123456"},
+            )
+
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        cards = data.get("cards")
+        self.assertIsInstance(cards, list)
+        auth_card = next((c for c in cards if isinstance(c, dict) and c.get("type") == "auth_session"), None)
+        self.assertIsInstance(auth_card, dict)
+        payload = auth_card.get("payload") if isinstance(auth_card, dict) else None
+        self.assertIsInstance(payload, dict)
+        self.assertTrue(payload.get("token"))
+
+    def test_product_and_dupe_routes_return_contract_cards(self) -> None:
+        os.environ["REDIS_URL"] = ""
+        app = create_app()
+        brief_id = f"brief_{uuid.uuid4().hex}"
+
+        with TestClient(app) as client:
+            parse_res = client.post(
+                "/v1/product/parse",
+                headers={"X-Brief-ID": brief_id},
+                json={"text": "La Roche Posay cleanser"},
+            )
+            self.assertEqual(parse_res.status_code, 200)
+            parse_cards = parse_res.json().get("cards") or []
+            self.assertTrue(any((c or {}).get("type") == "product_parse" for c in parse_cards))
+
+            analyze_res = client.post(
+                "/v1/product/analyze",
+                headers={"X-Brief-ID": brief_id},
+                json={"name": "La Roche Posay cleanser"},
+            )
+            self.assertEqual(analyze_res.status_code, 200)
+            analyze_cards = analyze_res.json().get("cards") or []
+            self.assertTrue(any((c or {}).get("type") == "product_analysis" for c in analyze_cards))
+
+            dupe_res = client.post(
+                "/v1/dupe/suggest",
+                headers={"X-Brief-ID": brief_id},
+                json={"original_text": "SK-II essence"},
+            )
+            self.assertEqual(dupe_res.status_code, 200)
+            dupe_cards = dupe_res.json().get("cards") or []
+            self.assertTrue(any((c or {}).get("type") == "dupe_suggest" for c in dupe_cards))

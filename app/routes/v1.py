@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import difflib
 import json
 import logging
@@ -1754,6 +1754,33 @@ def _extract_safety_flags(diagnosis_payload: Any, body: Any, stored: dict[str, A
         if f not in deduped:
             deduped.append(f)
     return deduped[:6]
+
+
+def _mock_auth_session_payload(email: str) -> dict[str, Any]:
+    exp = datetime.now(timezone.utc) + timedelta(days=30)
+    clean_email = (email or "").strip() or "user@pivota.local"
+    return {
+        "token": f"aurora_{uuid.uuid4().hex}",
+        "user": {"email": clean_email},
+        "expires_at": exp.isoformat(),
+    }
+
+
+def _to_chatbox_product_seed(name_or_query: str) -> dict[str, Any]:
+    text = str(name_or_query or "").strip() or "Skincare Product"
+    words = [w for w in re.split(r"\s+", text) if w]
+    brand = words[0].capitalize() if words else "Aurora"
+    name = " ".join(words[:6]) if words else "Skincare Product"
+    category = _guess_category_from_query(text)
+    return {
+        "sku_id": f"sku_{uuid.uuid4().hex[:12]}",
+        "name": name,
+        "brand": brand,
+        "category": category,
+        "description": f"{name} ({category})",
+        "image_url": "https://images.unsplash.com/photo-1556228720-195a672e8a03?w=400&h=400&fit=crop",
+        "size": "1 unit",
+    }
 
 
 def _truncate_event_payload(value: Any, limit: int = 2000) -> Any:
@@ -3689,6 +3716,268 @@ async def affiliate_outcome(
     _ = _require_brief_id(x_brief_id)
     # Store/reporting hook can be added later.
     return {"ok": True}
+
+
+@router.post("/auth/start")
+async def auth_start(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    email = str(body.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing email")
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text="Verification code sent. Please check your email.",
+        cards=[_make_card("auth_notice", {"status": "code_sent", "email": email})],
+        session_patch={},
+        events=[{"name": "auth_start"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/auth/verify")
+async def auth_verify(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    email = str(body.get("email") or "").strip()
+    code = str(body.get("code") or "").strip()
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="Missing email/code")
+
+    session_payload = _mock_auth_session_payload(email)
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text="Signed in.",
+        cards=[_make_card("auth_session", session_payload)],
+        session_patch={"auth": {"signed_in": True, "email": email}},
+        events=[{"name": "auth_verify"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/auth/password/login")
+async def auth_password_login(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    email = str(body.get("email") or "").strip()
+    password = str(body.get("password") or "").strip()
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Missing email/password")
+    session_payload = _mock_auth_session_payload(email)
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text="Signed in.",
+        cards=[_make_card("auth_session", session_payload)],
+        session_patch={"auth": {"signed_in": True, "email": email}},
+        events=[{"name": "auth_password_login"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/auth/password/set")
+async def auth_password_set(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    password = str(body.get("password") or "").strip()
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password too short")
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text="Password saved.",
+        cards=[_make_card("auth_notice", {"status": "password_set"})],
+        session_patch={},
+        events=[{"name": "auth_password_set"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/auth/logout")
+async def auth_logout(
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        assistant_text="Signed out.",
+        cards=[_make_card("auth_notice", {"status": "signed_out"})],
+        session_patch={"auth": {"signed_in": False}},
+        events=[{"name": "auth_logout"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/product/parse")
+async def product_parse(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    seed = str(body.get("text") or body.get("url") or body.get("name") or "").strip()
+    product = _to_chatbox_product_seed(seed or "Skincare Product")
+    card_payload = {"product": product, "confidence": 0.62}
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("product_parse", card_payload)],
+        session_patch={},
+        events=[{"name": "product_parse"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/product/analyze")
+async def product_analyze(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    product_raw = body.get("product") if isinstance(body.get("product"), dict) else None
+    if isinstance(product_raw, dict):
+        product = {**_to_chatbox_product_seed(str(product_raw.get("name") or product_raw.get("title") or "")), **product_raw}
+    else:
+        seed = str(body.get("name") or body.get("url") or "").strip()
+        product = _to_chatbox_product_seed(seed or "Skincare Product")
+
+    assessment = {
+        "verdict": "caution",
+        "reasons": [
+            "Good baseline fit for daily use.",
+            "Start low frequency and monitor irritation.",
+            "Prioritize sunscreen in AM when using actives.",
+        ],
+        "hero_ingredient": {
+            "name": "Niacinamide",
+            "role": "barrier support",
+            "why": "Supports oil balance and improves tolerance in many users.",
+        },
+        "anchor_product": product,
+        "how_to_use": "Use every other night for 1 week, then increase if tolerated.",
+    }
+    payload = {
+        "assessment": assessment,
+        "product": product,
+        "provenance": {
+            "source": "pivota_glow_agent_fallback",
+            "pipeline": "chatbox_compat.v1",
+            "dogfood_features_effective": {"show_employee_feedback_controls": False},
+        },
+    }
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("product_analysis", payload)],
+        session_patch={},
+        events=[{"name": "product_analyze"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/dupe/suggest")
+async def dupe_suggest(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+    original_seed = str(body.get("original_text") or body.get("original_url") or body.get("name") or "").strip()
+    original = _to_chatbox_product_seed(original_seed or "Target Product")
+
+    dupe_a = _to_chatbox_product_seed(f"{original.get('name')} budget")
+    dupe_b = _to_chatbox_product_seed(f"{original.get('name')} sensitive")
+    comp_a = _to_chatbox_product_seed(f"{original.get('name')} premium")
+
+    payload = {
+        "original": original,
+        "dupes": [
+            {
+                "kind": "dupe",
+                "similarity": 83,
+                "product": dupe_a,
+                "reasons": ["Similar core mechanism profile.", "Better price band."],
+                "tradeoffs": ["Texture may feel lighter than the original."],
+            },
+            {
+                "kind": "dupe",
+                "similarity": 76,
+                "product": dupe_b,
+                "reasons": ["Lower irritation profile in user reports."],
+                "tradeoffs": ["May work slower on intensive goals."],
+            },
+        ],
+        "comparables": [
+            {
+                "kind": "premium",
+                "similarity": 88,
+                "product": comp_a,
+                "reasons": ["Closest functional overlap among available options."],
+                "tradeoffs": ["Higher cost."],
+            }
+        ],
+    }
+
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("dupe_suggest", payload)],
+        session_patch={},
+        events=[{"name": "dupe_suggest"}],
+    )
+    return {**envelope, "ok": True}
+
+
+@router.post("/dupe/compare")
+async def dupe_compare(
+    body: dict[str, Any],
+    x_brief_id: Optional[str] = Header(default=None, alias="X-Brief-ID"),
+    x_trace_id: Optional[str] = Header(default=None, alias="X-Trace-ID"),
+):
+    _ = _require_brief_id(x_brief_id)
+    trace_id = _coerce_trace_id(x_trace_id)
+
+    original = body.get("original") if isinstance(body.get("original"), dict) else _to_chatbox_product_seed("Original Product")
+    dupe = body.get("dupe") if isinstance(body.get("dupe"), dict) else _to_chatbox_product_seed("Dupe Product")
+    payload = {
+        "original": original,
+        "dupe": dupe,
+        "similarity": 81,
+        "tradeoffs": [
+            "Dupe has lower cost but may have lighter texture.",
+            "Original may have slightly better long-term tolerance evidence.",
+        ],
+        "tradeoffs_detail": {
+            "missing_actives": [],
+            "added_benefits": ["better budget fit"],
+            "texture_finish_differences": ["dupe feels lighter"],
+            "availability_note": "Both options are usually available online.",
+        },
+    }
+    envelope = _build_envelope(
+        trace_id=trace_id,
+        cards=[_make_card("dupe_compare", payload)],
+        session_patch={},
+        events=[{"name": "dupe_compare"}],
+    )
+    return {**envelope, "ok": True}
 
 
 @router.post("/chat")
